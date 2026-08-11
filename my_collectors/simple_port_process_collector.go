@@ -10,6 +10,7 @@ import (
 	"log"      // 提供日志记录功能
 	"net"      // 提供网络相关功能，用于端口检测
 	"os"       // 提供操作系统接口，用于文件操作
+	"os/user"  // 提供用户信息查询功能，用于 UID 转用户名
 	"path/filepath" // 提供路径操作功能
 	"runtime"  // 提供运行时信息，用于内存统计
 	"strconv"  // 提供字符串与数字转换功能
@@ -2428,28 +2429,34 @@ func getProcessCwd(pid int) string {
 	cwdPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcCwdSuffix)
 	path, err := os.Readlink(procPathNoPrefix(cwdPath))
 	if err != nil || path == EmptyString {
-		return PathSeparator
+		return EmptyString // 改：失败返回空字符串，由 safeLabel 统一处理
 	}
 	return path
 }
 
-// getProcessUser 函数：获取进程的运行用户（UID）
+// getProcessUser 函数：获取进程的运行用户名（从 UID 转换）
 func getProcessUser(pid int) string {
 	statusPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatusSuffix)
 	content, err := os.ReadFile(procPathNoPrefix(statusPath))
 	if err != nil {
-		return PathSeparator
+		return EmptyString // 改：失败返回空字符串
 	}
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
 		if strings.HasPrefix(line, StatusFieldUid) {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 && fields[1] != EmptyString {
-				return fields[1]
+				uid := fields[1]
+				// UID → 用户名转换
+				if u, err := user.LookupId(uid); err == nil {
+					return u.Username
+				}
+				// 转换失败保留 UID（如容器内无 /etc/passwd）
+				return uid
 			}
 		}
 	}
-	return PathSeparator
+	return EmptyString // 改：解析失败返回空字符串
 }
 
 // getProcessCwdCached 获取进程工作目录（复用进程身份缓存）
