@@ -12,7 +12,6 @@ import (
 	"os"       // 提供操作系统接口，用于文件操作
 	"path/filepath" // 提供路径操作功能
 	"runtime"  // 提供运行时信息，用于内存统计
-	"sort"     // 提供排序功能，用于优化缓存清理算法
 	"strconv"  // 提供字符串与数字转换功能
 	"strings"  // 提供字符串操作功能
 	"sync"     // 提供同步原语，用于并发控制
@@ -109,15 +108,6 @@ const (
 	// ProcessStatusExpireTime 进程状态过期时间
 	// 进程基础状态信息在缓存中的有效期
 	ProcessStatusExpireTime = time.Hour
-
-	// ========== 缓存大小限制 ==========
-	// MaxStringCacheSize 字符串缓存最大大小
-	// 限制字符串缓存的最大条目数，防止内存无限增长
-	MaxStringCacheSize = 10000
-
-	// StringCacheCleanupSize 字符串缓存清理大小
-	// 当缓存超过最大大小时，清理的条目数量
-	StringCacheCleanupSize = 5000
 
 	// ========== 端口范围 ==========
 	// MinPortNumber 最小端口号
@@ -275,6 +265,7 @@ const (
 	GoroutineProcessStatusWorker    = "process-status-worker"
 	GoroutinePidCacheCleanWorker    = "pid-cache-clean-worker"
 	GoroutineMemoryCleanupWorker    = "memory-cleanup-worker"
+	GoroutineForceRescanWorker      = "force-rescan-worker"
 
 	// 错误消息模板
 	ErrMsgFailedToOpenProc          = "failed to open /proc: %v"
@@ -339,14 +330,6 @@ func (sfh *SafeFileHandle) Close() error {
 		log.Printf("[simple_port_process_collector] failed to close file %s: %v", sfh.path, err)
 	}
 	return err
-}
-
-// Read 读取文件内容
-func (sfh *SafeFileHandle) Read() ([]byte, error) {
-	if sfh.file == nil {
-		return nil, fmt.Errorf("file handle is closed")
-	}
-	return os.ReadFile(sfh.path)
 }
 
 // ReadDir 读取目录内容
@@ -449,11 +432,6 @@ func NewSafeStringBuilder(capacity int) *SafeStringBuilder {
 // WriteString 写入字符串
 func (ssb *SafeStringBuilder) WriteString(s string) {
 	ssb.builder.WriteString(s)
-}
-
-// WriteByte 写入字节
-func (ssb *SafeStringBuilder) WriteByte(c byte) {
-	ssb.builder.WriteByte(c)
 }
 
 // String 获取字符串结果
@@ -601,7 +579,7 @@ var scanInterval = func() time.Duration {
 	if v := os.Getenv(EnvPortLabelInterval); v != EmptyString {
 		// 解析环境变量中的时间间隔
 		d, err := time.ParseDuration(v)
-		if err == nil {
+		if err == nil && d > 0 {
 			return d
 		}
 	}
@@ -682,70 +660,70 @@ func NewSimplePortProcessCollector() *SimplePortProcessCollector {
 		portTCPAliveDesc: prometheus.NewDesc(
 			"node_tcp_port_alive",                    // 指标名称：节点TCP端口存活状态
 			"TCP端口存活状态 (1=存活, 0=死亡)",           // 指标描述：TCP端口的存活状态
-			[]string{"process_name", "exe_path", "port"}, nil, // 标签：进程名、可执行文件路径、端口号
+			[]string{"process_name", "exe_path", "workdir", "username", "port"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户、端口号
 		),
 		// TCP端口响应时间指标描述符
 		// 监控端口响应时间，单位为秒
 		portTCPResponseTimeDesc: prometheus.NewDesc(
 			"node_tcp_port_response_time_seconds",     // 指标名称：节点TCP端口响应时间
 			"TCP端口响应时间(秒)",                       // 指标描述：TCP端口的响应时间
-			[]string{"process_name", "exe_path", "port"}, nil, // 标签：进程名、可执行文件路径、端口号
+			[]string{"process_name", "exe_path", "workdir", "username", "port"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户、端口号
 		),
 		// 进程存活指标描述符
-		// 监控进程是否运行，包含进程状态信息
+		// 监控进程是否运行（1=存活，0=死亡）
 		processAliveDesc: prometheus.NewDesc(
 			"node_process_alive",                     // 指标名称：节点进程存活状态
-			"进程存活状态 (1=存活, 0=死亡) 包含进程状态",  // 指标描述：进程的存活状态和状态信息
-			[]string{"process_name", "exe_path", "state"}, nil, // 标签：进程名、可执行文件路径、进程状态
+			"进程存活状态 (1=存活, 0=死亡)",            // 指标描述：进程的存活状态
+			[]string{"process_name", "exe_path", "workdir", "username"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户
 		),
 		// 进程CPU使用率指标描述符
 		// 监控进程的CPU使用率百分比
 		processCPUPercentDesc: prometheus.NewDesc(
 			"node_process_cpu_percent",               // 指标名称：节点进程CPU使用率
 			"进程CPU使用率百分比",                      // 指标描述：进程CPU使用率百分比
-			[]string{"process_name", "exe_path"}, nil, // 标签：进程名、可执行文件路径
+			[]string{"process_name", "exe_path", "workdir", "username"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户
 		),
 		// 进程内存使用率指标描述符
 		// 监控进程的物理内存使用率百分比
 		processMemPercentDesc: prometheus.NewDesc(
 			"node_process_memory_percent",            // 指标名称：节点进程内存使用率
 			"进程物理内存使用率百分比",                  // 指标描述：进程物理内存使用率百分比
-			[]string{"process_name", "exe_path"}, nil, // 标签：进程名、可执行文件路径
+			[]string{"process_name", "exe_path", "workdir", "username"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户
 		),
 		// 进程物理内存指标描述符
 		// 监控进程实际使用的物理内存大小（字节）
 		processVMRSSDesc: prometheus.NewDesc(
 			"node_process_memory_rss_bytes",          // 指标名称：节点进程物理内存使用量
 			"进程使用的物理内存大小(字节)",              // 指标描述：进程实际使用的物理内存大小
-			[]string{"process_name", "exe_path"}, nil, // 标签：进程名、可执行文件路径
+			[]string{"process_name", "exe_path", "workdir", "username"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户
 		),
 		// 进程虚拟内存指标描述符
 		// 监控进程使用的虚拟内存大小（字节）
 		processVMSizeDesc: prometheus.NewDesc(
 			"node_process_memory_vms_bytes",          // 指标名称：节点进程虚拟内存使用量
 			"进程使用的虚拟内存大小(字节)",              // 指标描述：进程使用的虚拟内存大小
-			[]string{"process_name", "exe_path"}, nil, // 标签：进程名、可执行文件路径
+			[]string{"process_name", "exe_path", "workdir", "username"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户
 		),
 		// 进程线程数指标描述符
 		// 监控进程中的线程总数
 		processThreadsDesc: prometheus.NewDesc(
 			"node_process_threads",                   // 指标名称：节点进程线程数
 			"进程中的线程总数",                         // 指标描述：进程中的线程总数
-			[]string{"process_name", "exe_path"}, nil, // 标签：进程名、可执行文件路径
+			[]string{"process_name", "exe_path", "workdir", "username"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户
 		),
 		// 进程IO读取指标描述符
 		// 监控进程每秒从磁盘读取的数据量（字节/秒）
 		processIOReadDesc: prometheus.NewDesc(
 			"node_process_io_read_bytes_per_second",  // 指标名称：节点进程IO读取速率
 			"进程每秒从磁盘读取的数据量(字节/秒)",         // 指标描述：进程每秒从磁盘读取的数据量
-			[]string{"process_name", "exe_path"}, nil, // 标签：进程名、可执行文件路径
+			[]string{"process_name", "exe_path", "workdir", "username"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户
 		),
 		// 进程IO写入指标描述符
 		// 监控进程每秒向磁盘写入的数据量（字节/秒）
 		processIOWriteDesc: prometheus.NewDesc(
 			"node_process_io_write_bytes_per_second", // 指标名称：节点进程IO写入速率
 			"进程每秒向磁盘写入的数据量(字节/秒)",         // 指标描述：进程每秒向磁盘写入的数据量
-			[]string{"process_name", "exe_path"}, nil, // 标签：进程名、可执行文件路径
+			[]string{"process_name", "exe_path", "workdir", "username"}, nil, // 标签：进程名、可执行文件路径、工作目录、用户
 		),
 	}
 }
@@ -1036,7 +1014,8 @@ func updateProcessAliveCache(key string, status int) {
 // 该函数启动一个后台goroutine，定期清理过期的进程PID缓存
 // 专门用于清理进程重启后的旧PID缓存，防止内存泄漏
 func startProcessPidCacheCleanWorker() {
-	go func() {
+	// 使用 goroutineManager 管理，获得 panic 恢复和生命周期管理
+	goroutineManager.StartGoroutine(GoroutinePidCacheCleanWorker, func() {
 		// 创建定时器，按照配置的间隔定期清理进程缓存
 		ticker := time.NewTicker(processPidCacheCleanInterval)
 		defer ticker.Stop() // 确保定时器被正确关闭
@@ -1054,7 +1033,7 @@ func startProcessPidCacheCleanWorker() {
 				cleanProcessCaches(activePidKeys)
 			}
 		}
-	}()
+	})
 }
 
 // getCurrentActivePidKeys 获取当前活跃进程的PID键
@@ -1089,6 +1068,7 @@ func init() {
 	startProcessStatusDetectionWorker() // 启动进程状态检测工作器
 	startProcessPidCacheCleanWorker()   // 启动进程PID缓存清理工作器
 	startMemoryCleanupWorker()          // 启动内存清理工作器
+	startForceRescanWorker()            // 启动强制重扫工作器
 }
 
 // shutdownOnce 确保关闭操作只执行一次的同步原语
@@ -1104,6 +1084,7 @@ func ShutdownWorkers() {
 		close(processStatusDetectionQueue.done)  // 关闭进程状态检测队列
 		close(processPidCacheCleanQueue.done)    // 关闭进程PID缓存清理队列
 		close(memoryCleanupQueue.done)           // 关闭内存清理队列
+		close(forceRescanQueue.done)             // 关闭强制重扫队列
 
 		// 使用goroutine管理器优雅关闭所有goroutine
 		goroutineManager.Shutdown()
@@ -1119,7 +1100,7 @@ var (
 	portStatusInterval = func() time.Duration {
 		if v := os.Getenv("PORT_STATUS_INTERVAL"); v != "" {
 			d, err := time.ParseDuration(v)
-			if err == nil {
+			if err == nil && d > 0 {
 				return d
 			}
 		}
@@ -1131,7 +1112,7 @@ var (
 	processAliveStatusInterval = func() time.Duration {
 		if v := os.Getenv("PROCESS_ALIVE_STATUS_INTERVAL"); v != "" {
 			d, err := time.ParseDuration(v)
-			if err == nil {
+			if err == nil && d > 0 {
 				return d
 			}
 		}
@@ -1143,7 +1124,7 @@ var (
 	portCheckTimeout = func() time.Duration {
 		if v := os.Getenv("PORT_CHECK_TIMEOUT"); v != "" {
 			d, err := time.ParseDuration(v)
-			if err == nil {
+			if err == nil && d > 0 {
 				return d
 			}
 		}
@@ -1242,32 +1223,34 @@ var processIdentityCache = struct {
 type ProcessIdentity struct {
 	ProcessName string    `json:"process_name"` // 进程名称
 	ExePath     string    `json:"exe_path"`     // 可执行文件路径
+	WorkDir     string    `json:"work_dir"`     // 工作目录
+	Username    string    `json:"username"`     // 运行用户
 	CurrentPid  int       `json:"current_pid"`  // 当前进程ID
 	LastSeen    time.Time `json:"last_seen"`    // 最后见到的时间
 	IsAlive     bool      `json:"is_alive"`     // 是否存活
 }
 
-// forceRescanGuard 强制重扫节流器
-// 防止频繁的强制重扫导致系统开销过大
-// 使用匿名结构体，包含互斥锁和最后重扫时间
-var forceRescanGuard = struct {
-    sync.Mutex  // 互斥锁，保证并发安全
-    last time.Time // 最后一次重扫的时间戳
-}{}
+// forceRescanSignal 强制重扫信号通道（缓冲为1，用于合并多次触发）
+// 采用"信号合并"模式：多次触发只会保留一个待处理请求，既不丢失也不积压
+var forceRescanSignal = make(chan struct{}, 1)
 
-// forceRescanPortProcess 立即强制刷新端口-进程映射与相关缓存（带最小间隔节流）
-// 该函数用于在检测到进程重启时强制重新扫描端口-进程映射关系
-// 使用节流机制防止频繁重扫导致系统开销过大
+// forceRescanPortProcess 请求强制刷新端口-进程映射（非阻塞，合并触发）
+// 该函数用于在检测到进程重启时请求重新扫描端口-进程映射关系。
+// 它只发送一个信号，实际扫描由 startForceRescanWorker 后台 worker 执行，
+// 相比旧的"丢弃式节流"，本方案确保 5s 窗口内的重扫请求不会被静默丢弃：
+// 若已有待处理请求（channel 满），则本次合并到该请求中，扫描时会覆盖处理最新状态。
 func forceRescanPortProcess() {
-    // 节流检查：确保最小间隔时间
-    forceRescanGuard.Lock()
-    if time.Since(forceRescanGuard.last) < ForceRescanThrottleInterval {
-        forceRescanGuard.Unlock()
-        return // 距离上次重扫时间太短，跳过本次重扫
+    select {
+    case forceRescanSignal <- struct{}{}:
+        // 成功投递重扫请求
+    default:
+        // 已有待处理请求，合并本次触发（无需重复投递）
     }
-    forceRescanGuard.last = time.Now() // 更新最后重扫时间
-    forceRescanGuard.Unlock()
+}
 
+// doForceRescan 执行实际的端口-进程映射扫描并刷新缓存
+// 仅由 startForceRescanWorker 单一 worker 调用，天然串行，无需额外节流锁
+func doForceRescan() {
     // 执行端口-进程映射扫描
     scanned := discoverPortProcess()
     now := time.Now()
@@ -1284,6 +1267,28 @@ func forceRescanPortProcess() {
         dataCopy := append([]PortProcessInfo(nil), scanned...)
         cleanStalePortCaches(dataCopy) // 清理过期的缓存项
     }
+}
+
+// startForceRescanWorker 启动强制重扫后台 worker
+// 消费 forceRescanSignal，串行执行重扫。每次重扫后强制等待 ForceRescanThrottleInterval，
+// 保证两次重扫之间的最小间隔（防止重扫积压），同时不丢失请求（信号已在 channel 中等待）。
+func startForceRescanWorker() {
+    goroutineManager.StartGoroutine(GoroutineForceRescanWorker, func() {
+        for {
+            select {
+            case <-forceRescanQueue.done:
+                return
+            case <-forceRescanSignal:
+                doForceRescan()
+                // 重扫后节流等待，避免频繁重扫；期间新到的请求会在 channel 中排队（最多1个）
+                select {
+                case <-time.After(ForceRescanThrottleInterval):
+                case <-forceRescanQueue.done:
+                    return
+                }
+            }
+        }
+    })
 }
 
 // processStatusCache 进程状态缓存
@@ -1372,13 +1377,19 @@ var memoryCleanupQueue = struct {
 	done chan struct{}   // 关闭信号通道，用于优雅关闭清理工作器
 }{done: make(chan struct{})}
 
+// forceRescanQueue 强制重扫队列
+// 用于优雅关闭强制重扫 worker
+var forceRescanQueue = struct {
+	done chan struct{}   // 关闭信号通道，用于优雅关闭重扫工作器
+}{done: make(chan struct{})}
+
 // processStatusInterval 进程状态检测间隔配置
 // 支持通过环境变量 PROCESS_STATUS_INTERVAL 进行配置
 // 控制进程详细状态检测的频率
 var processStatusInterval = func() time.Duration {
 	if v := os.Getenv("PROCESS_STATUS_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
-		if err == nil {
+		if err == nil && d > 0 {
 			return d
 		}
 	}
@@ -1391,7 +1402,7 @@ var processStatusInterval = func() time.Duration {
 var processPidCacheCleanInterval = func() time.Duration {
 	if v := os.Getenv("PROCESS_PID_CACHE_CLEAN_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
-		if err == nil {
+		if err == nil && d > 0 {
 			return d
 		}
 	}
@@ -1479,8 +1490,9 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, info := range infos {
 		// 只处理TCP协议的端口
 		if info.Protocol == "tcp" {
-			// 构建指标标签
-			labels := []string{info.ProcessName, info.ExePath, strconv.Itoa(info.Port)}
+			// 构建指标标签（workdir/username 与进程指标统一从身份缓存解析，保证一致）
+			portWorkdir, portUsername := resolveWorkdirUsername(info.ProcessName, info.ExePath, info.WorkDir, info.Username)
+			labels := []string{info.ProcessName, info.ExePath, portWorkdir, portUsername, strconv.Itoa(info.Port)}
 
 			// 避免对同一端口重复检测
 			if !tcpPortDone[info.Port] {
@@ -1518,10 +1530,15 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 				// 先更新进程身份信息（解决服务重启问题）- 智能选择PID
 				// 必须在计算性能指标之前更新，确保使用正确的PID
+				// ✓ 修复：只有当选出的 PID 仍然有效时才更新，避免死进程刷新 LastSeen
 				if len(groupInfos) > 0 {
 					// 智能选择PID：优先选择存活的进程，确保身份信息准确
 					selectedPid := selectBestPidForIdentity(groupInfos)
-					updateProcessIdentity(info.ProcessName, info.ExePath, selectedPid)
+					// 只有 PID 有效时才更新身份缓存（刷新 LastSeen）
+					// 死 PID 不更新，让清理器在 2-3 分钟内淘汰，而不是等 8 小时扫描
+					if isProcessValid(selectedPid) {
+						updateProcessIdentity(info.ProcessName, info.ExePath, selectedPid)
+					}
 				}
 
 				// 使用智能进程身份状态检查（解决服务重启问题）
@@ -1705,11 +1722,15 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						stateValue = "?"
 					}
 
+					// 解析 workdir/username 标签值（与端口指标共用同一解析逻辑，保证一致）
+					workdirLabel, usernameLabel := resolveWorkdirUsername(info.ProcessName, info.ExePath, info.WorkDir, info.Username)
+
 					// 进程存活状态（累计）- 使用智能身份管理
 					// 生成进程存活状态指标（累计）- 使用智能身份管理
+					// 注：不再暴露 state 标签，避免进程状态切换（R/S/D 等）造成时间序列基数抖动
 					ch <- prometheus.MustNewConstMetric(
 						c.processAliveDesc, prometheus.GaugeValue, float64(aliveValue),
-						info.ProcessName, info.ExePath, stateValue,
+						info.ProcessName, info.ExePath, workdirLabel, usernameLabel,
 					)
 
 					// 生成累计的性能指标（进程挂了时设为0）
@@ -1738,43 +1759,43 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 					// CPU使用率指标
 					ch <- prometheus.MustNewConstMetric(
 						c.processCPUPercentDesc, prometheus.GaugeValue, cpuPercent,
-						info.ProcessName, info.ExePath,
+						info.ProcessName, info.ExePath, workdirLabel, usernameLabel,
 					)
 
 					// 内存使用率指标
 					ch <- prometheus.MustNewConstMetric(
 						c.processMemPercentDesc, prometheus.GaugeValue, memPercent,
-						info.ProcessName, info.ExePath,
+						info.ProcessName, info.ExePath, workdirLabel, usernameLabel,
 					)
 
 					// 物理内存使用量指标（转换为字节）
 					ch <- prometheus.MustNewConstMetric(
 						c.processVMRSSDesc, prometheus.GaugeValue, vmRSS,
-						info.ProcessName, info.ExePath,
+						info.ProcessName, info.ExePath, workdirLabel, usernameLabel,
 					)
 
 					// 虚拟内存使用量指标（转换为字节）
 					ch <- prometheus.MustNewConstMetric(
 						c.processVMSizeDesc, prometheus.GaugeValue, vmSize,
-						info.ProcessName, info.ExePath,
+						info.ProcessName, info.ExePath, workdirLabel, usernameLabel,
 					)
 
 					// 线程数量指标
 					ch <- prometheus.MustNewConstMetric(
 						c.processThreadsDesc, prometheus.GaugeValue, threads,
-						info.ProcessName, info.ExePath,
+						info.ProcessName, info.ExePath, workdirLabel, usernameLabel,
 					)
 
 					// IO读取速率指标（转换为字节/秒）
 					ch <- prometheus.MustNewConstMetric(
 						c.processIOReadDesc, prometheus.GaugeValue, ioRead,
-						info.ProcessName, info.ExePath,
+						info.ProcessName, info.ExePath, workdirLabel, usernameLabel,
 					)
 
 					// IO写入速率指标（转换为字节/秒）
 					ch <- prometheus.MustNewConstMetric(
 						c.processIOWriteDesc, prometheus.GaugeValue, ioWrite,
-						info.ProcessName, info.ExePath,
+						info.ProcessName, info.ExePath, workdirLabel, usernameLabel,
 					)
 				}
 
@@ -1933,14 +1954,17 @@ func discoverPortProcess() []PortProcessInfo {
 				}
 
 				// 构建端口进程信息并添加到结果中
+				// workdir/username 复用进程身份缓存，避免每次扫描重复 readlink/读文件
+				safeName := safeLabel(exeName)
+				safeExe := safeLabel(exePath)
 				results = append(results, PortProcessInfo{
-					ProcessName: safeLabel(exeName),                    // 进程名（安全标签）
-					ExePath:     safeLabel(exePath),                    // 可执行文件路径（安全标签）
-					Port:        port,                                  // 端口号
-					Pid:         pid,                                   // 进程ID
-					WorkDir:     safeLabel(getProcessCwd(pid)),         // 工作目录（安全标签）
-					Username:    safeLabel(getProcessUser(pid)),       // 用户名（安全标签）
-					Protocol:    TCPProtocol,                          // 协议类型
+					ProcessName: safeName,                                              // 进程名（安全标签）
+					ExePath:     safeExe,                                               // 可执行文件路径（安全标签）
+					Port:        port,                                                  // 端口号
+					Pid:         pid,                                                   // 进程ID
+					WorkDir:     safeLabel(getProcessCwdCached(pid, safeName, safeExe)), // 工作目录（缓存+安全标签）
+					Username:    safeLabel(getProcessUserCached(pid, safeName, safeExe)),// 用户名（缓存+安全标签）
+					Protocol:    TCPProtocol,                                           // 协议类型
 				})
 			}
 		}
@@ -2027,7 +2051,7 @@ var hostIPCache = struct {
 var hostIPCacheInterval = func() time.Duration {
 	if v := os.Getenv("HOST_IP_CACHE_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
-		if err == nil {
+		if err == nil && d > 0 {
 			return d
 		}
 	}
@@ -2428,6 +2452,58 @@ func getProcessUser(pid int) string {
 	return PathSeparator
 }
 
+// getProcessCwdCached 获取进程工作目录（复用进程身份缓存）
+// 若身份缓存中已有该进程（名称+路径）且 PID 未变化，则直接返回缓存值，
+// 避免每次扫描都对 /proc/<pid>/cwd 执行 readlink，同时保证标签值稳定不抖动。
+// processName、exePath 需为与身份缓存 key 一致的（已 safeLabel 处理的）值。
+func getProcessCwdCached(pid int, processName, exePath string) string {
+	key := getProcessIdentityKey(processName, exePath)
+	processIdentityCache.RLock()
+	identity, exists := processIdentityCache.cache[key]
+	processIdentityCache.RUnlock()
+	// 命中条件：同一 PID 且已缓存非空工作目录
+	if exists && identity.CurrentPid == pid && identity.WorkDir != EmptyString {
+		return identity.WorkDir
+	}
+	// 未命中，读取真实值（调用方负责写回身份缓存）
+	return getProcessCwd(pid)
+}
+
+// getProcessUserCached 获取进程运行用户（复用进程身份缓存）
+// 逻辑同 getProcessCwdCached：命中则复用缓存，未命中读取 /proc/<pid>/status。
+func getProcessUserCached(pid int, processName, exePath string) string {
+	key := getProcessIdentityKey(processName, exePath)
+	processIdentityCache.RLock()
+	identity, exists := processIdentityCache.cache[key]
+	processIdentityCache.RUnlock()
+	if exists && identity.CurrentPid == pid && identity.Username != EmptyString {
+		return identity.Username
+	}
+	return getProcessUser(pid)
+}
+
+// resolveWorkdirUsername 统一解析进程的 workdir/username 标签值
+// 优先使用进程身份缓存中的稳定值（跨重启一致），回退到当次扫描的 fallback 值，
+// 最后经 safeLabel 兜底空值。端口指标与进程指标共用此函数，保证两类指标标签一致，
+// 便于 PromQL 按 process_name/exe_path/workdir/username 做 join。
+func resolveWorkdirUsername(processName, exePath, fallbackWorkdir, fallbackUsername string) (workdir, username string) {
+	workdir = fallbackWorkdir
+	username = fallbackUsername
+	key := getProcessIdentityKey(processName, exePath)
+	processIdentityCache.RLock()
+	identity, exists := processIdentityCache.cache[key]
+	processIdentityCache.RUnlock()
+	if exists {
+		if identity.WorkDir != EmptyString {
+			workdir = identity.WorkDir
+		}
+		if identity.Username != EmptyString {
+			username = identity.Username
+		}
+	}
+	return safeLabel(workdir), safeLabel(username)
+}
+
 // safeLabel 保证 Prometheus 标签不为空，若为空则返回 "/"
 func safeLabel(val string) string {
 	if strings.TrimSpace(val) == EmptyString {
@@ -2473,25 +2549,29 @@ var DefaultExcludedProcesses = []string{
 	"dnsmasq",
 }
 
-var excludedProcessNames = func() []string {
+// mergedExcludedProcesses 合并后的排除进程名列表（包初始化时构建，避免运行时重复 append 和全局 slice 污染）
+var mergedExcludedProcesses = func() []string {
+	result := make([]string, 0, len(DefaultExcludedProcesses)+10)
+	// 添加默认排除列表
+	result = append(result, DefaultExcludedProcesses...)
+	// 添加环境变量配置的排除列表
 	env := os.Getenv(EnvExcludedProcessNames)
-	if env == EmptyString {
-		return nil
-	}
-	var result []string
-	for _, name := range strings.Split(env, CommaSeparator) {
-		n := strings.TrimSpace(name)
-		if n != EmptyString {
-			result = append(result, n)
+	if env != EmptyString {
+		for _, name := range strings.Split(env, CommaSeparator) {
+			n := strings.TrimSpace(name)
+			if n != EmptyString {
+				result = append(result, n)
+			}
 		}
 	}
 	return result
 }()
 
+// isExcludedProcess 检查进程是否在排除列表中（模糊匹配：进程名包含排除项即排除）
+// 例如排除 "ssh" 会同时排除 "ssh"、"sshd"、"sshfs" 等
 func isExcludedProcess(exeName string) bool {
-	all := append(DefaultExcludedProcesses, excludedProcessNames...)
-	for _, name := range all {
-		if strings.Contains(exeName, name) {
+	for _, pattern := range mergedExcludedProcesses {
+		if strings.Contains(exeName, pattern) {
 			return true
 		}
 	}
@@ -2985,39 +3065,10 @@ func getPidKey(pid int) string {
 	return stringUtils.BuildPidKey(pid, startTime)
 }
 
-// 字符串缓存结构体，包含缓存映射和访问时间戳
-// 用于实现基于时间戳的缓存清理策略，避免清理最近使用的缓存项
-var stringCache = struct {
-	sync.RWMutex
-	cache map[string]string        // 字符串缓存映射，key为原始字符串，value为缓存值
-	accessTime map[string]time.Time // 访问时间映射，key为原始字符串，value为最后访问时间
-}{
-	cache: make(map[string]string),
-	accessTime: make(map[string]time.Time),
-}
-
-// getProcessIdentityKey 生成进程身份key（基于进程名+路径）- 使用缓存
-// 该函数使用带时间戳的缓存机制，记录每次访问时间
-// 用于后续的基于时间戳的缓存清理策略
+// getProcessIdentityKey 生成进程身份key（基于进程名+路径）
+// 直接使用字符串工具构建进程键，无需缓存（缓存的 key->key 映射无实际收益且引入全局锁开销）
 func getProcessIdentityKey(processName, exePath string) string {
-	// 使用字符串工具构建进程键
-	key := stringUtils.BuildProcessKey(processName, exePath)
-
-	stringCache.Lock()
-	defer stringCache.Unlock()
-
-	if cached, exists := stringCache.cache[key]; exists {
-		// 更新访问时间戳
-		stringCache.accessTime[key] = time.Now()
-		updatePerformanceStats(OpCacheHit, 0)
-		return cached
-	}
-
-	// 缓存未命中，创建新字符串并缓存
-	stringCache.cache[key] = key
-	stringCache.accessTime[key] = time.Now()
-	updatePerformanceStats(OpCacheMiss, 0)
-	return key
+	return stringUtils.BuildProcessKey(processName, exePath)
 }
 
 // selectBestPidForIdentity 智能选择最佳PID用于身份管理
@@ -3042,26 +3093,54 @@ func updateProcessIdentity(processName, exePath string, pid int) ProcessIdentity
 	key := getProcessIdentityKey(processName, exePath)
 	now := time.Now()
 
+	// 检查 PID 是否有效（进程是否存活）
+	// 防御性检查：即使调用方已检查，这里再次确认，确保不为死进程刷新 LastSeen
+	pidValid := isProcessValid(pid)
+
 	processIdentityCache.RLock()
 	identity, exists := processIdentityCache.cache[key]
 	processIdentityCache.RUnlock()
 
 	if !exists {
-		// 新进程，创建身份信息
+		// 新进程
+		if !pidValid {
+			// PID 无效，返回死亡标记，不创建缓存项（避免为死进程污染缓存）
+			return ProcessIdentity{
+				ProcessName: processName,
+				ExePath:     exePath,
+				CurrentPid:  pid,
+				IsAlive:     false,
+			}
+		}
+		// PID 有效，创建身份信息，读取并缓存 workdir 和 username
 		identity = ProcessIdentity{
 			ProcessName: processName,
 			ExePath:     exePath,
+			WorkDir:     getProcessCwd(pid),
+			Username:    getProcessUser(pid),
 			CurrentPid:  pid,
 			LastSeen:    now,
 			IsAlive:     true,
 		}
 	} else {
-		// 更新现有进程信息
+		// 缓存已存在
+		if !pidValid {
+			// PID 无效，不刷新 LastSeen（让清理器在 2-3 分钟淘汰）
+			// 返回现有缓存但不更新，保持 LastSeen 停滞
+			return identity
+		}
+		// PID 有效，正常更新
+		// 如果 PID 变化了（进程重启），需要更新 workdir 和 username
+		if identity.CurrentPid != pid {
+			identity.WorkDir = getProcessCwd(pid)
+			identity.Username = getProcessUser(pid)
+		}
 		identity.CurrentPid = pid
 		identity.LastSeen = now
 		identity.IsAlive = true
 	}
 
+	// 只有 PID 有效时才写回缓存（刷新 LastSeen）
 	processIdentityCache.Lock()
 	processIdentityCache.cache[key] = identity
 	processIdentityCache.Unlock()
@@ -3081,11 +3160,16 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 		// 未找到进程身份，尝试直接查找当前进程
 		alivePid := findAliveProcessInGroup(processName, exePath)
 		if alivePid > 0 {
-			// 找到存活进程，创建新的身份信息
+			// 找到存活进程，创建新的身份信息，读取并缓存 workdir 和 username
+			// 先在锁外读取 workdir/username（涉及文件 IO），避免持锁执行慢速操作
+			newWorkDir := getProcessCwd(alivePid)
+			newUsername := getProcessUser(alivePid)
 			processIdentityCache.Lock()
 			processIdentityCache.cache[key] = ProcessIdentity{
 				ProcessName: processName,
 				ExePath:     exePath,
+				WorkDir:     newWorkDir,
+				Username:    newUsername,
 				CurrentPid:  alivePid,
 				LastSeen:    time.Now(),
 				IsAlive:     true,
@@ -3116,10 +3200,15 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 				// 为了性能，仅在文件不存在时才进行查找
 				alivePid := findAliveProcessInGroup(processName, exePath)
 				if alivePid > 0 {
-					// 找到其他存活进程，更新身份信息
+					// 找到其他存活进程，更新身份信息，同时更新 workdir 和 username
+					// 先在锁外读取 workdir/username（涉及文件 IO），避免持锁执行慢速操作
+					newWorkDir := getProcessCwd(alivePid)
+					newUsername := getProcessUser(alivePid)
 					processIdentityCache.Lock()
 					if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
 						updatedIdentity.CurrentPid = alivePid
+						updatedIdentity.WorkDir = newWorkDir
+						updatedIdentity.Username = newUsername
 						updatedIdentity.IsAlive = true
 						updatedIdentity.LastSeen = time.Now()
 						processIdentityCache.cache[key] = updatedIdentity
@@ -3175,10 +3264,15 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 			// 当前PID已死，尝试查找同组其他存活进程
 			alivePid := findAliveProcessInGroup(processName, exePath)
 			if alivePid > 0 {
-				// 找到其他存活进程，更新身份信息
+				// 找到其他存活进程，更新身份信息，同时更新 workdir 和 username
+				// 先在锁外读取 workdir/username（涉及文件 IO），避免持锁执行慢速操作
+				newWorkDir := getProcessCwd(alivePid)
+				newUsername := getProcessUser(alivePid)
 				processIdentityCache.Lock()
 				if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
 					updatedIdentity.CurrentPid = alivePid
+					updatedIdentity.WorkDir = newWorkDir
+					updatedIdentity.Username = newUsername
 					updatedIdentity.IsAlive = true
 					updatedIdentity.LastSeen = time.Now()
 					processIdentityCache.cache[key] = updatedIdentity
@@ -3204,10 +3298,15 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 	// 进程已标记为死亡，但需要重新检查是否真的死亡
 	alivePid := findAliveProcessInGroup(processName, exePath)
 	if alivePid > 0 {
-		// 发现进程重新启动，更新身份信息
+		// 发现进程重新启动，更新身份信息，同时更新 workdir 和 username
+		// 先在锁外读取 workdir/username（涉及文件 IO），避免持锁执行慢速操作
+		newWorkDir := getProcessCwd(alivePid)
+		newUsername := getProcessUser(alivePid)
 		processIdentityCache.Lock()
 		if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
 			updatedIdentity.CurrentPid = alivePid
+			updatedIdentity.WorkDir = newWorkDir
+			updatedIdentity.Username = newUsername
 			updatedIdentity.IsAlive = true
 			updatedIdentity.LastSeen = time.Now()
 			processIdentityCache.cache[key] = updatedIdentity
@@ -3398,7 +3497,8 @@ func startProcessStatusDetectionWorker() {
 // 该函数启动一个后台goroutine，定期清理过期的缓存数据
 // 防止内存无限增长，提高系统稳定性
 func startMemoryCleanupWorker() {
-	go func() {
+	// 使用 goroutineManager 管理，获得 panic 恢复和生命周期管理
+	goroutineManager.StartGoroutine(GoroutineMemoryCleanupWorker, func() {
 		// 创建定时器，按照配置的间隔定期清理缓存
 		ticker := time.NewTicker(DefaultMemoryCleanupInterval)
 		defer ticker.Stop() // 确保定时器被正确关闭
@@ -3414,7 +3514,7 @@ func startMemoryCleanupWorker() {
 				cleanupExpiredCaches()
 			}
 		}
-	}()
+	})
 }
 
 // cleanupExpiredCaches 清理过期的缓存数据
@@ -3422,42 +3522,6 @@ func startMemoryCleanupWorker() {
 // 包括字符串缓存、进程身份缓存、端口状态缓存、进程存活缓存、进程状态缓存和进程详细状态缓存
 func cleanupExpiredCaches() {
 	now := time.Now()
-
-	// 清理字符串缓存（基于时间戳的清理策略）
-	// 当缓存大小超过限制时，清理最久未访问的缓存项
-	stringCache.Lock()
-	if len(stringCache.cache) > MaxStringCacheSize {
-		// 基于时间戳清理最久未访问的缓存项
-		// 收集所有缓存项及其访问时间
-		type cacheItem struct {
-			key        string        // 缓存键
-			accessTime time.Time     // 最后访问时间
-		}
-
-		items := make([]cacheItem, 0, len(stringCache.accessTime))
-		for key, accessTime := range stringCache.accessTime {
-			items = append(items, cacheItem{key: key, accessTime: accessTime})
-		}
-
-		// 按访问时间排序（最久未访问的在前）
-		// 使用Go标准库的sort包，时间复杂度O(n log n)
-		sort.Slice(items, func(i, j int) bool {
-			return items[i].accessTime.Before(items[j].accessTime)
-		})
-
-		// 清理最久未访问的缓存项
-		cleanupCount := StringCacheCleanupSize
-		if cleanupCount > len(items) {
-			cleanupCount = len(items)
-		}
-
-		for i := 0; i < cleanupCount; i++ {
-			key := items[i].key
-			delete(stringCache.cache, key)
-			delete(stringCache.accessTime, key)
-		}
-	}
-	stringCache.Unlock()
 
 	// 清理进程身份缓存中的过期项
 	// 清理超过指定时间未见的进程身份，防止缓存无限增长
@@ -3776,11 +3840,20 @@ func getProcessIOStats(pid int) (float64, float64, error) {
 	scanner := bufio.NewScanner(strings.NewReader(string(content)))
 	for scanner.Scan() {
 		line := scanner.Text()
+		// /proc/<pid>/io 每行格式为 "字段名: 数值"，用 Fields 解析更可靠
 		if strings.HasPrefix(line, IOFieldReadBytes) {
-			fmt.Sscanf(line, "%s %f", &readBytes)
+			if fields := strings.Fields(line); len(fields) >= 2 {
+				if v, err := strconv.ParseFloat(fields[1], 64); err == nil {
+					readBytes = v
+				}
+			}
 		}
 		if strings.HasPrefix(line, IOFieldWriteBytes) {
-			fmt.Sscanf(line, "%s %f", &writeBytes)
+			if fields := strings.Fields(line); len(fields) >= 2 {
+				if v, err := strconv.ParseFloat(fields[1], 64); err == nil {
+					writeBytes = v
+				}
+			}
 		}
 	}
 	return readBytes, writeBytes, nil

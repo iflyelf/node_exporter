@@ -10,7 +10,7 @@ on:
         default: 'build Sync'
   # 定时触发（每6小时）
   schedule:
-     - cron: '* */6 * * *'
+     - cron: '0 */6 * * *'
   # 点Star触发
   watch:
      types: [started]
@@ -33,7 +33,7 @@ jobs:
     steps:
     # 第一步：检出主仓库和所有子模块代码
     - name: 检出代码（包含子模块）
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         token: ${{ secrets.CI_TOKEN }}
         submodules: true

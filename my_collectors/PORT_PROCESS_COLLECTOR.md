@@ -235,7 +235,12 @@ export ENABLE_HTTP_DETECTION=false
 - `node_http_port_alive`: HTTP 端口存活状态 (1=存活, 0=死亡)
 - `node_process_alive`: 进程存活状态 (1=存活, 0=死亡)
 
-所有指标都包含标签：`process_name`, `exe_path`, `port`（除了 `node_process_alive` 使用 `process_name` 和 `exe_path`）。
+标签说明：
+
+- TCP 端口指标（`node_tcp_port_alive`、`node_tcp_port_response_time_seconds`）：`process_name`, `exe_path`, `workdir`, `username`, `port`
+- 进程指标（`node_process_alive` 及 CPU/内存/线程/IO 等）：`process_name`, `exe_path`, `workdir`, `username`
+
+其中 `workdir`（进程工作目录）与 `username`（运行用户 UID）通过进程身份缓存复用，读取一次后在进程生命周期内保持稳定，进程退出后随缓存过期清理（2-5 分钟），**彻底避免时间序列基数抖动**。所有进程指标共享相同的四元组标签，可直接按 `process_name`/`exe_path`/`workdir`/`username` 做 PromQL join。
 
 ## 故障排除
 
