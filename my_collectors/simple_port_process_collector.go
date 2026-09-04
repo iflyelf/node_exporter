@@ -2038,6 +2038,19 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 	return checkPortTCPWithTimeout(port, portCheckTimeout)
 }
 
+// closeConnWithReset 以 RST 方式关闭探测连接。
+// 探测仅需确认端口可连通，不传输任何数据。若使用默认的 FIN 四次挥手关闭，
+// 当对端（被探测服务/防火墙）不正确响应 FIN 时，本地内核 TCB 会长时间停留在
+// FIN_WAIT2 等状态无法释放，高频探测下累积成大量僵尸连接（TCP_inuse/alloc 暴涨）。
+// 通过设置 SO_LINGER=0，Close 时内核直接发送 RST 立即销毁连接，避免 TCB 堆积。
+func closeConnWithReset(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		// 忽略错误：即使设置失败也继续走普通 Close
+		_ = tcpConn.SetLinger(0)
+	}
+	_ = conn.Close()
+}
+
 // ========== 宿主机IP检测相关代码 ==========
 // 这些代码专门用于容器环境中的宿主机IP检测，比环境变量检测更准确
 
@@ -2178,7 +2191,8 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 	}
 
 	// 定义常用IP地址列表，优先检测这些地址
-	commonAddrs := []string{LocalhostIPv4, AnyIPv4, LocalhostIPv6, AnyIPv6}
+	// 注意：0.0.0.0 / :: 是通配地址，不应作为拨号目标（会被内核路由到回环，产生额外无效连接），已移除
+	commonAddrs := []string{LocalhostIPv4, LocalhostIPv6}
 	minResp := -1.0
 	found := false
 	var failedAddrs []string // 记录失败的地址
@@ -2190,7 +2204,8 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), timeout)
 		cost := time.Since(start).Seconds()
 		if err == nil {
-			conn.Close()
+			// 使用 RST 方式关闭，避免 FIN 四次挥手在对端异常时导致内核 TCB 长时间无法释放
+			closeConnWithReset(conn)
 			if minResp < 0 || cost < minResp {
 				minResp = cost
 				bestIP = ip
@@ -2294,8 +2309,8 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 			d := &net.Dialer{Timeout: timeout}
 			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
 			if err == nil {
-				// 连接成功立即关闭
-				conn.Close()
+				// 使用 RST 方式关闭，避免 FIN 四次挥手在对端异常时导致内核 TCB 长时间无法释放
+				closeConnWithReset(conn)
 				cost := time.Since(start).Seconds()
 				// 可选：记录成功的连接（仅在调试模式下）
 				if EnablePortCheckDebugLog {
