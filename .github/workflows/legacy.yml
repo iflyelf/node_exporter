@@ -1,8 +1,8 @@
-name: Build legacy node_exporter (CentOS 6 / kernel 2.6.32)
+name: Build legacy node_exporter (kernel 2.6.32-3.10)
 
-# 最新版 node_exporter（Go 1.23+）在 CentOS 6 / kernel 2.6.32 上运行会报
+# 最新版 node_exporter（Go 1.23+）在旧内核（2.6.32-3.10）上运行会报
 # "fatal error: procresize: invalid arg"。此工作流使用 Go 1.17（最后支持
-# CentOS 6 的版本）单独构建 legacy 资产。
+# 旧内核的版本）单独构建 legacy 资产。
 on:
   workflow_dispatch:
   schedule:
@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   build-legacy:
-    runs-on: ubuntu-20.04  # Ubuntu 20.04 支持 Go 1.17
+    runs-on: ubuntu-20.04  # 旧版 Runner 支持 Go 1.17
     steps:
       - name: 检出代码（包含子模块）
         uses: actions/checkout@v5
@@ -34,7 +34,7 @@ jobs:
         run: |
           bash my_collectors/auto_register_collectors.sh
 
-      - name: 设置 Go 1.17（最后支持 CentOS 6 的版本）
+      - name: 设置 Go 1.17（最后支持 kernel 2.6.32-3.10 的版本）
         uses: actions/setup-go@v5
         with:
           go-version: '1.17.13'
@@ -62,7 +62,7 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "REVISION=$REVISION" >> $GITHUB_ENV
           echo "BRANCH=$BRANCH" >> $GITHUB_ENV
-          echo "BUILDUSER=xiaonuo (CentOS 6 legacy)" >> $GITHUB_ENV
+          echo "BUILDUSER=xiaonuo (kernel 2.6.32-3.10 legacy)" >> $GITHUB_ENV
           echo "BUILDDATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%dT%H:%M:%S+08:00')" >> $GITHUB_ENV
 
       - name: 调试版本信息
