@@ -199,14 +199,20 @@ jobs:
         with:
           submodules: true
 
+      - name: 检出 v1.7.0 代码（Go 1.19 兼容）
+        working-directory: node_exporter
+        run: |
+          git fetch --tags
+          git checkout v1.7.0
+
       - name: 自动注册自定义采集器
         run: |
           bash my_collectors/auto_register_collectors.sh
 
-      - name: 设置 Go 1.17（最后支持 kernel 2.6.32-3.10 的版本）
+      - name: 设置 Go 1.19（最后支持 kernel 2.6.32-3.10 的版本）
         uses: actions/setup-go@v5
         with:
-          go-version: '1.17.13'
+          go-version: '1.19.13'
           cache-dependency-path: node_exporter/go.sum
 
       - name: 设置版本信息环境变量
@@ -242,12 +248,10 @@ jobs:
           echo "BUILDUSER: $BUILDUSER"
           echo "BUILDDATE: $BUILDDATE"
 
-      - name: 构建 legacy 多架构二进制（Go 1.17 + 静态编译）
+      - name: 构建 legacy 多架构二进制（Go 1.19 + 静态编译）
         working-directory: node_exporter
         run: |
           set -euo pipefail
-          # Go 1.17 无法处理 go.mod 中的 go 1.25.0，临时降级
-          sed -i 's/^go 1\.[0-9]\+\.[0-9]\+$/go 1.17/' go.mod
           go mod download
           mkdir -p .build/linux-amd64-legacy .build/linux-arm64-legacy
           LDFLAGS="-s -w \
@@ -273,7 +277,7 @@ jobs:
           for f in .build/linux-amd64-legacy/node_exporter-linux-amd64-legacy \
                    .build/linux-arm64-legacy/node_exporter-linux-arm64-legacy; do
             echo "== $f =="
-            strings -a "$f" | grep -aoE 'go1\.17(\.[0-9]+)?' | sort -u | head -1
+            strings -a "$f" | grep -aoE 'go1\.19(\.[0-9]+)?' | sort -u | head -1
           done
 
       - name: 上传构建产物
