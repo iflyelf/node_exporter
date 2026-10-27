@@ -1,0 +1,127 @@
+name: Build legacy node_exporter (CentOS 6 / kernel 2.6.32)
+
+# 最新版 node_exporter（Go 1.23+）在 CentOS 6 / kernel 2.6.32 上运行会报
+# "fatal error: procresize: invalid arg"。此工作流使用 Go 1.17（最后支持
+# CentOS 6 的版本）单独构建 legacy 资产。
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 22:30（Asia/Shanghai）构建一次，避开主构建任务
+    - cron: '30 14 * * *'
+  push:
+    paths:
+      - '.github/workflows/legacy.yml'
+      - 'my_collectors/**'
+      - 'node_exporter/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: node_exporter-legacy-release
+  cancel-in-progress: true
+
+jobs:
+  build-legacy:
+    runs-on: ubuntu-20.04  # Ubuntu 20.04 支持 Go 1.17
+    steps:
+      - name: 检出代码（包含子模块）
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: 自动注册自定义采集器
+        run: |
+          bash my_collectors/auto_register_collectors.sh
+
+      - name: 设置 Go 1.17（最后支持 CentOS 6 的版本）
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.17.13'
+          cache-dependency-path: node_exporter/go.sum
+
+      - name: 设置版本信息环境变量
+        working-directory: node_exporter
+        run: |
+          git fetch --tags
+          if [ -f "VERSION" ]; then
+            VERSION=$(cat VERSION | tr -d '\n\r')
+          elif git describe --tags --abbrev=0 2>/dev/null; then
+            VERSION=$(git describe --tags --abbrev=0)
+          elif git describe --tags --exact-match 2>/dev/null; then
+            VERSION=$(git describe --tags --exact-match)
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          VERSION="${VERSION}-legacy"
+          REVISION=$(git rev-parse HEAD)
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          if [ "$BRANCH" = "HEAD" ]; then
+            BRANCH="master"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "REVISION=$REVISION" >> $GITHUB_ENV
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          echo "BUILDUSER=xiaonuo (CentOS 6 legacy)" >> $GITHUB_ENV
+          echo "BUILDDATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%dT%H:%M:%S+08:00')" >> $GITHUB_ENV
+
+      - name: 调试版本信息
+        run: |
+          echo "VERSION: $VERSION"
+          echo "BRANCH: $BRANCH"
+          echo "REVISION: $REVISION"
+          echo "BUILDUSER: $BUILDUSER"
+          echo "BUILDDATE: $BUILDDATE"
+
+      - name: 构建 legacy 多架构二进制（Go 1.17 + 静态编译）
+        working-directory: node_exporter
+        run: |
+          set -euo pipefail
+          go mod tidy
+          mkdir -p .build/linux-amd64-legacy .build/linux-arm64-legacy
+          LDFLAGS="-s -w \
+            -X 'github.com/prometheus/common/version.Version=${VERSION}' \
+            -X 'github.com/prometheus/common/version.Branch=${BRANCH}' \
+            -X 'github.com/prometheus/common/version.Revision=${REVISION}' \
+            -X 'github.com/prometheus/common/version.BuildUser=${BUILDUSER}' \
+            -X 'github.com/prometheus/common/version.BuildDate=${BUILDDATE}'"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="$LDFLAGS" -o .build/linux-amd64-legacy/node_exporter-linux-amd64-legacy
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+            -ldflags="$LDFLAGS" -o .build/linux-arm64-legacy/node_exporter-linux-arm64-legacy
+          sha256sum \
+            .build/linux-amd64-legacy/node_exporter-linux-amd64-legacy \
+            .build/linux-arm64-legacy/node_exporter-linux-arm64-legacy > .build/legacy-sha256sums.txt
+          ls -lh .build/linux-amd64-legacy/* .build/linux-arm64-legacy/*
+          cat .build/legacy-sha256sums.txt
+
+      - name: 验证 Go 版本
+        working-directory: node_exporter
+        run: |
+          set -euo pipefail
+          for f in .build/linux-amd64-legacy/node_exporter-linux-amd64-legacy \
+                   .build/linux-arm64-legacy/node_exporter-linux-arm64-legacy; do
+            echo "== $f =="
+            strings -a "$f" | grep -aoE 'go1\.17(\.[0-9]+)?' | sort -u | head -1
+          done
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v5
+        with:
+          name: node_exporter-legacy-binaries
+          path: |
+            node_exporter/.build/linux-amd64-legacy/node_exporter-linux-amd64-legacy
+            node_exporter/.build/linux-arm64-legacy/node_exporter-linux-arm64-legacy
+            node_exporter/.build/legacy-sha256sums.txt
+
+      - name: 发布到 latest Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: Latest Release
+          files: |
+            node_exporter/.build/linux-amd64-legacy/node_exporter-linux-amd64-legacy
+            node_exporter/.build/linux-arm64-legacy/node_exporter-linux-arm64-legacy
+            node_exporter/.build/legacy-sha256sums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
