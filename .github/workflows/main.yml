@@ -191,7 +191,7 @@ jobs:
 
   build-legacy:
     name: 构建 legacy 二进制版本（kernel 2.6.32-3.10）
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     if: github.event.repository.owner.id == github.event.sender.id || ! github.event.sender.id
     steps:
       - name: 检出代码（包含子模块）
