@@ -239,6 +239,37 @@ var deploymentSystemNames = map[string]struct{}{
 	"umountroot": {}, "umountfs": {}, "sendsigs": {}, "bootlogs": {},
 	"hwclock": {}, "hostname": {}, "killprocs": {}, "single": {},
 	"halt": {}, "reboot": {},
+	// RHEL / CentOS 6
+	"abrtd": {}, "cpuspeed": {}, "netfs": {}, "nfslock": {},
+	"rpc.statd": {}, "rpc.idmapd": {}, "rpc.svcgssd": {}, "rpc.gssd": {},
+	"mdmonitor": {}, "sysstat": {}, "saslauthd": {}, "certmonger": {},
+	"matahari": {}, "piranha": {}, "ricci": {}, "luci": {},
+	"libvirtd": {}, "virtlockd": {}, "virtlogd": {}, "xend": {}, "xendomains": {},
+	"haldaemon": {}, "messagebus": {}, "readahead": {}, "restorecond": {},
+	"mcstrans": {}, "setroubleshoot": {}, "yum-updatesd": {}, "yum-cron": {},
+	"netconsole": {}, "postfix": {}, "sendmail": {}, "exim": {},
+	"portreserve": {}, "iscsiuio": {}, "fcoe": {}, "lldpad": {}, "dcbd": {},
+	"nslcd": {}, "pcscd": {}, "hplip": {}, "xdm": {}, "kdm": {}, "lxdm": {},
+	"slim": {}, "mcelog": {}, "rasdaemon": {}, "psacct": {}, "acct": {},
+	"autofs": {}, "ypbind": {}, "ypserv": {}, "yppasswdd": {}, "ypxfrd": {},
+	// SUSE 12
+	"splash": {}, "splash_early": {}, "earlysyslog": {}, "klogd": {}, "syslog": {},
+	"after-local": {}, "purge-kernels": {}, "snapper": {}, "btrfsmaintenance": {},
+	"wicked": {}, "wickedd": {}, "wickedd-nanny": {},
+	"susefirewall2": {}, "susefirewall2_init": {}, "susefirewall2_setup": {},
+	"openvswitch": {}, "ovs-vswitchd": {}, "ovsdb-server": {},
+	"start-ttys": {}, "control-alt-delete": {}, "init-system-dbus": {}, "prefdm": {},
+	"xinetd": {}, "inetd": {}, "rsh": {}, "rlogin": {}, "rexec": {},
+	"opensm": {}, "ibacm": {}, "cgmanager": {}, "cgproxy": {},
+	// Ubuntu 14 Upstart
+	"mountall": {}, "rc-sysinit": {}, "failsafe-x": {}, "ureadahead": {},
+	"container-detect": {}, "setvtrgb": {}, "pcmcia": {}, "pcmciautils": {},
+	"usbmuxd": {}, "gpu-manager": {},
+	"bootlogd": {}, "mountnfs": {}, "umountnfs": {}, "mountoverflowtmp": {},
+	"rmnologin": {}, "urandom": {}, "mtab": {}, "binfmt-support": {},
+	"module-init-tools": {}, "ondemand": {}, "screen-cleanup": {}, "startpar": {},
+	"bridge-utils": {}, "vlan": {}, "ifupdown": {}, "resolvconf": {},
+	"friendly-recovery": {}, "open-iscsi": {}, "passwd": {},
 }
 
 // deploymentSystemExecBasenames 系统工具类可执行文件，非自定义部署不作为服务展示
@@ -291,6 +322,16 @@ var deploymentSystemPrefixes = []string{
 	"whoopsie", "kerneloops", "pollinate", "apparmor", "selinux",
 	"cryptdisks", "paxctl", "procps", "pulseaudio", "seatd", "tlp",
 	"x11", "acpi", "console-setup", "keyboard-setup", "replace-lightdm",
+	// RHEL / CentOS 6
+	"abrt", "iscsi", "nfs", "rpc.", "rpc-", "libvirt", "virt", "xen",
+	"readahead", "setroubleshoot", "yum-", "matahari", "piranha", "ipa-",
+	"yp", "mcelog", "pcsc", "rdma", "ipoib", "sblim",
+	// SUSE 12
+	"splash", "earlysyslog", "boot.", "after-", "snapper", "btrfs",
+	"wicked", "suse", "openvswitch", "ovs-",
+	// Ubuntu 14 Upstart
+	"mountall", "mounted-", "network-", "tty", "console", "upstart-",
+	"udev", "failsafe", "rc-", "pcmcia", "start-", "init-system", "lxc",
 }
 
 // deploymentInteractiveNames 交互式/短生命周期命令黑名单，避免把用户登录态进程当成服务
@@ -355,6 +396,7 @@ func deploymentNormalizeServiceName(name string) string {
 	name = strings.TrimSuffix(name, ".service")
 	name = strings.TrimSuffix(name, ".timer")
 	name = strings.TrimSuffix(name, ".socket")
+	name = strings.TrimSuffix(name, ".sh")
 	if idx := strings.Index(name, "@"); idx >= 0 {
 		name = name[:idx]
 	}
@@ -631,6 +673,9 @@ func deploymentInventorySources() []deploymentInventorySource {
 	if deploymentEnvBool("DEPLOYMENT_INVENTORY_INITD", true) {
 		sources = append(sources, deploymentInventorySource{name: "initd", collect: deploymentCollectInitd})
 	}
+	if deploymentEnvBool("DEPLOYMENT_INVENTORY_UPSTART", true) {
+		sources = append(sources, deploymentInventorySource{name: "upstart", collect: deploymentCollectUpstart})
+	}
 	if deploymentEnvBool("DEPLOYMENT_INVENTORY_SUPERVISOR", true) {
 		sources = append(sources, deploymentInventorySource{name: "supervisor", collect: deploymentCollectSupervisor})
 	}
@@ -769,6 +814,19 @@ collectLoop:
 		len(snapshot.services), len(snapshot.crons), snapshot.duration.Round(time.Millisecond))
 }
 
+// deploymentIsGenericRuntime 判断是否为通用运行时（多个业务进程可能共用同一 exe）
+func deploymentIsGenericRuntime(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	base = strings.TrimSuffix(base, ".exe")
+	switch base {
+	case "java", "python", "python2", "python3", "node", "nodejs", "ruby", "perl",
+		"php", "php-fpm", "sh", "bash", "dash", "env", "mono", "dotnet",
+		"gunicorn", "uwsgi", "supervisord":
+		return true
+	}
+	return false
+}
+
 // deploymentMergeServices 合并来自不同数据源的重复服务，并限制最大条目数
 func deploymentMergeServices(input []deploymentInventoryService) []deploymentInventoryService {
 	if len(input) == 0 {
@@ -777,6 +835,7 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 
 	merged := make(map[string]*deploymentInventoryService, len(input))
 	nameIndex := make(map[string][]string) // 服务名 -> 配置类服务去重键
+	exeIndex := make(map[string][]string)  // 可执行文件 -> 配置类服务去重键
 
 	mergeInto := func(dst, src *deploymentInventoryService) {
 		if src.Path != "" && dst.Path == "" {
@@ -835,6 +894,11 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 		merged[key] = &copySvc
 		nameKey := deploymentNormalizeServiceName(svc.Name)
 		nameIndex[nameKey] = append(nameIndex[nameKey], key)
+		if (svc.Source == "initd" || svc.Source == "supervisor" || svc.Source == "upstart") &&
+			svc.Exe != "" && svc.Exe != "unknown" && !deploymentIsGenericRuntime(svc.Exe) {
+			exeKey := strings.TrimSuffix(svc.Exe, " (deleted)")
+			exeIndex[exeKey] = append(exeIndex[exeKey], key)
+		}
 	}
 
 	// 第二轮：进程扫描结果，优先合并到同名的 systemd/initd/supervisor 条目
@@ -854,12 +918,25 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 			continue
 		}
 
-		// 非 systemd 单元进程：尝试按名称合并到 initd / supervisor 配置
+		// 非 systemd 单元进程：优先按可执行文件路径合并到 initd / supervisor / upstart 配置
+		// （老系统常见服务名与进程名不一致，如 initd mysql -> 进程 mysqld）
+		if strings.HasPrefix(key, "process:") && svc.Exe != "" && svc.Exe != "unknown" {
+			exeKey := strings.TrimSuffix(svc.Exe, " (deleted)")
+			if keys := exeIndex[exeKey]; len(keys) == 1 {
+				target := merged[keys[0]]
+				if target != nil && (target.Source == "initd" || target.Source == "supervisor" || target.Source == "upstart") {
+					mergeInto(target, &svc)
+					continue
+				}
+			}
+		}
+
+		// 再按名称合并
 		if strings.HasPrefix(key, "process:") {
 			nameKey := deploymentNormalizeServiceName(svc.Name)
 			if keys := nameIndex[nameKey]; len(keys) == 1 {
 				target := merged[keys[0]]
-				if target != nil && (target.Source == "initd" || target.Source == "supervisor") {
+				if target != nil && (target.Source == "initd" || target.Source == "supervisor" || target.Source == "upstart") {
 					mergeInto(target, &svc)
 					continue
 				}
@@ -1378,7 +1455,11 @@ func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, 
 	}
 
 	enabled := make(map[string]bool)
-	rcPatterns := []string{"/etc/rc*.d/S*", "/etc/rc.d/rc*.d/S*"}
+	rcPatterns := []string{
+		"/etc/rc*.d/S*",
+		"/etc/rc.d/rc*.d/S*",
+		"/etc/init.d/rc*.d/S*", // SUSE
+	}
 	for _, pattern := range rcPatterns {
 		matches, _ := filepath.Glob(deploymentHostPath(pattern))
 		for _, match := range matches {
@@ -1418,14 +1499,24 @@ func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, 
 			!deploymentEnvBool("DEPLOYMENT_INVENTORY_INCLUDE_DISABLED_INITD", false) {
 			continue
 		}
+		exe, userName, cwd := deploymentParseInitdScript(path)
+		if exe == "" {
+			exe = "unknown"
+		}
+		if userName == "" {
+			userName = "unknown"
+		}
+		if cwd == "" {
+			cwd = "unknown"
+		}
 		services = append(services, deploymentInventoryService{
 			Name:        name,
 			Path:        path,
-			User:        "unknown",
+			User:        userName,
 			StartupType: "initd",
-			Middleware:  middleware,
-			Cwd:         "unknown",
-			Exe:         "unknown",
+			Middleware:  deploymentDetectMiddleware(name, exe, "", ""),
+			Cwd:         cwd,
+			Exe:         exe,
 			Root:        "/",
 			Status:      "unknown",
 			Enabled:     strconv.FormatBool(enabled[name]),
@@ -1436,6 +1527,361 @@ func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, 
 	}
 	if err := ctx.Err(); err != nil {
 		return services, nil, err
+	}
+	return services, nil, nil
+}
+
+// deploymentParseInitdScript 从 SysV init 脚本中提取可执行文件、运行用户、工作目录
+// 老系统（RHEL/CentOS 6、SUSE 12、Ubuntu 14）很多服务名与进程名不同，
+// 解析出 DAEMON/PROG 后可与 /proc 进程按 exe 精确合并。
+func deploymentParseInitdScript(path string) (exe, userName, cwd string) {
+	data, err := deploymentReadFileLimited(path, 512*1024)
+	if err != nil {
+		return "", "", ""
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "exec ") {
+			if candidate := deploymentParseExecStart(line[len("exec "):]); strings.HasPrefix(candidate, "/") {
+				exe = candidate
+			}
+			continue
+		}
+		if strings.HasPrefix(lower, "cd ") {
+			candidate := strings.Trim(strings.TrimSpace(line[len("cd "):]), `"'`)
+			if strings.HasPrefix(candidate, "/") && !strings.ContainsAny(candidate, "$`") {
+				cwd = candidate
+				continue
+			}
+		}
+		if strings.Contains(lower, "start-stop-daemon") && strings.Contains(lower, "--exec") {
+			fields := strings.Fields(line)
+			for i, field := range fields {
+				if field == "--exec" && i+1 < len(fields) {
+					candidate := strings.Trim(fields[i+1], `"'`)
+					if strings.HasPrefix(candidate, "/") {
+						exe = candidate
+					}
+				}
+			}
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := strings.ToUpper(strings.TrimSpace(line[:idx]))
+		value := strings.TrimSpace(line[idx+1:])
+		switch key {
+		case "DAEMON", "PROG", "EXEC", "BINARY", "DAEMON_BIN", "SERVICE_BIN", "APP_BIN",
+			"HTTPD", "MYSQLD", "MYSQL", "NGINX", "REDIS", "POSTGRES", "POSTMASTER",
+			"TOMCAT", "JAVA", "NODE", "PYTHON", "GUNICORN", "UWSGI", "SERVER",
+			"BIN", "START_BIN", "CMD", "COMMAND":
+			if candidate := deploymentExtractAbsolutePath(value); candidate != "" {
+				exe = candidate
+			}
+		case "USER", "DAEMON_USER", "RUN_AS", "RUNAS", "TOMCAT_USER", "MYSQL_USER", "HTTPD_USER":
+			candidate := strings.Trim(value, `"'`)
+			if candidate != "" && !strings.ContainsAny(candidate, "$%{}`") {
+				userName = candidate
+			}
+		}
+	}
+	return exe, userName, cwd
+}
+
+// deploymentExtractAbsolutePath 从 shell 变量赋值中提取绝对路径
+func deploymentExtractAbsolutePath(value string) string {
+	for _, token := range strings.Fields(value) {
+		token = strings.Trim(token, `"'(){};`)
+		idx := strings.Index(token, "/")
+		if idx < 0 {
+			continue
+		}
+		candidate := strings.TrimRight(token[idx:], `}")';`)
+		if !strings.HasPrefix(candidate, "/") || strings.ContainsAny(candidate, "$`") {
+			continue
+		}
+		lower := strings.ToLower(candidate)
+		skip := false
+		for _, ext := range []string{
+			".pid", ".lock", ".log", ".conf", ".cfg", ".xml",
+			".properties", ".json", ".yaml", ".yml", ".socket",
+		} {
+			if strings.HasSuffix(lower, ext) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		return candidate
+	}
+	return ""
+}
+
+// ==========================================================================
+// 数据源：Upstart（Ubuntu 14 / RHEL 6 等老系统）
+// ==========================================================================
+
+type deploymentUpstartJob struct {
+	name     string
+	exec     string
+	user     string
+	cwd      string
+	hasStart bool
+	manual   bool
+}
+
+// deploymentParseUpstartJob 解析 /etc/init/*.conf
+func deploymentParseUpstartJob(path string) (*deploymentUpstartJob, error) {
+	data, err := deploymentReadFileLimited(path, deploymentMaxFileSize)
+	if err != nil {
+		return nil, err
+	}
+	job := &deploymentUpstartJob{
+		name: strings.TrimSuffix(filepath.Base(path), ".conf"),
+		user: "root",
+		cwd:  "/",
+	}
+	section := ""
+	mainScriptCmd := ""
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if section != "" {
+			if lower == "end script" {
+				section = ""
+				continue
+			}
+			if section == "script" && mainScriptCmd == "" {
+				mainScriptCmd = deploymentParseUpstartScriptCommand(line)
+			}
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		keyword := strings.ToLower(fields[0])
+		switch keyword {
+		case "start":
+			if len(fields) >= 2 && strings.ToLower(fields[1]) == "on" {
+				job.hasStart = true
+			}
+		case "exec":
+			if len(fields) >= 2 {
+				job.exec = deploymentParseUpstartExec(strings.Join(fields[1:], " "))
+			}
+		case "setuid":
+			if len(fields) >= 2 {
+				job.user = strings.Trim(fields[1], `"'`)
+			}
+		case "chdir":
+			if len(fields) >= 2 {
+				job.cwd = strings.Trim(strings.Join(fields[1:], " "), `"'`)
+			}
+		case "script":
+			section = "script"
+		case "pre-start", "post-start", "pre-stop", "post-stop":
+			if len(fields) >= 2 && strings.ToLower(fields[1]) == "script" {
+				section = keyword
+			}
+		}
+	}
+	if job.exec == "" && mainScriptCmd != "" {
+		job.exec = mainScriptCmd
+	}
+
+	// /etc/init/<job>.override 中的 manual 表示不自动启动
+	overridePath := strings.TrimSuffix(path, ".conf") + ".override"
+	if override, err := deploymentReadFileLimited(overridePath, deploymentMaxFileSize); err == nil {
+		for _, line := range strings.Split(string(override), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if strings.EqualFold(line, "manual") {
+				job.manual = true
+			}
+		}
+	}
+	return job, nil
+}
+
+func deploymentParseUpstartExec(value string) string {
+	fields := strings.Fields(strings.TrimSpace(value))
+	for i, field := range fields {
+		if field == "--exec" && i+1 < len(fields) {
+			return strings.Trim(fields[i+1], `"'`)
+		}
+	}
+	return deploymentParseExecStart(value)
+}
+
+func deploymentParseUpstartScriptCommand(line string) string {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if lower == "" || strings.HasPrefix(lower, "#") {
+		return ""
+	}
+	if strings.HasPrefix(lower, "exec ") {
+		return deploymentParseUpstartExec(line[len("exec "):])
+	}
+	if strings.HasPrefix(lower, "start-stop-daemon") {
+		return deploymentParseUpstartExec(line)
+	}
+	for _, skip := range []string{
+		"[", "if ", "then", "else", "fi", "case ", "esac", "while ", "do ", "done",
+		"export ", "umask ", "cd ", "set ", "trap ", "ulimit ", "nice ", "su ",
+		"daemon ", "$", "}", "{", "start ", "stop ", "status ", "kill ", "echo ",
+		"logger ", "sleep ", "test ", "which ", "command ",
+	} {
+		if strings.HasPrefix(lower, skip) {
+			return ""
+		}
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return ""
+	}
+	candidate := strings.Trim(fields[0], `"'`)
+	if strings.HasPrefix(candidate, "/") {
+		return candidate
+	}
+	return ""
+}
+
+// deploymentUpstartStatus 通过 initctl list 获取 job 运行状态（老系统 initctl 在 /sbin）
+func deploymentUpstartStatus(ctx context.Context) (map[string]string, bool) {
+	status := make(map[string]string)
+	if deploymentHostRoot() != "" {
+		return status, false
+	}
+	bin := ""
+	for _, candidate := range []string{"initctl", "/sbin/initctl", "/usr/sbin/initctl"} {
+		if p, err := exec.LookPath(candidate); err == nil {
+			bin = p
+			break
+		}
+	}
+	if bin == "" {
+		return status, false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, bin, "list").Output()
+	if err != nil {
+		return status, false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[0]
+		state := ""
+		for _, field := range fields[1:] {
+			if strings.Contains(field, "/") {
+				state = strings.TrimSuffix(field, ",")
+				break
+			}
+		}
+		if state == "" {
+			state = strings.TrimSuffix(fields[1], ",")
+		}
+		switch {
+		case strings.HasPrefix(state, "start/"):
+			status[name] = "running"
+		case strings.HasPrefix(state, "stop/"):
+			status[name] = "stopped"
+		default:
+			status[name] = strings.ToLower(state)
+		}
+	}
+	return status, true
+}
+
+func deploymentCollectUpstart(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+	initDir := deploymentHostPath("/etc/init")
+	entries, err := os.ReadDir(initDir)
+	if err != nil {
+		return nil, nil, nil // 非 Upstart 系统视为无数据
+	}
+	statusMap, statusKnown := deploymentUpstartStatus(ctx)
+
+	var services []deploymentInventoryService
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return services, nil, ctx.Err()
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
+			continue
+		}
+		jobName := strings.TrimSuffix(entry.Name(), ".conf")
+		if deploymentIsSystemService(jobName) {
+			continue
+		}
+		job, err := deploymentParseUpstartJob(filepath.Join(initDir, entry.Name()))
+		if err != nil || job == nil {
+			continue
+		}
+		middleware := deploymentDetectMiddleware(jobName, job.exec, "", "")
+		if middleware == "none" && deploymentIsSystemExec(job.exec) {
+			continue
+		}
+
+		enabled := "unknown"
+		switch {
+		case job.manual:
+			enabled = "false"
+		case job.hasStart:
+			enabled = "true"
+		default:
+			enabled = "static"
+		}
+
+		status := "unknown"
+		if state, ok := statusMap[jobName]; ok {
+			status = state
+		} else if statusKnown {
+			status = "stopped"
+		}
+
+		path := job.exec
+		if path == "" {
+			path = filepath.Join(initDir, entry.Name())
+		}
+		cwd := job.cwd
+		if cwd == "" {
+			cwd = "/"
+		}
+		services = append(services, deploymentInventoryService{
+			Name:        jobName,
+			Path:        path,
+			User:        job.user,
+			StartupType: "upstart",
+			Middleware:  middleware,
+			Cwd:         cwd,
+			Exe:         job.exec,
+			Root:        "/",
+			Status:      status,
+			Enabled:     enabled,
+			Source:      "upstart",
+			dedupKey:    "upstart:" + jobName,
+			instances:   0,
+		})
 	}
 	return services, nil, nil
 }
@@ -1691,23 +2137,74 @@ func deploymentCollectDocker(ctx context.Context) ([]deploymentInventoryService,
 	defer cancel()
 	format := `{{.Names}}|{{.Image}}|{{.State}}|{{.Label "com.docker.compose.project"}}`
 	out, err := exec.CommandContext(cctx, dockerBin, "ps", "-a", "--format", format).Output()
-	if err != nil {
-		return nil, nil, fmt.Errorf("docker ps failed: %w", err)
+
+	type containerRow struct {
+		name  string
+		image string
+		state string
+	}
+	var rows []containerRow
+
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			fields := strings.Split(line, "|")
+			if len(fields) < 3 {
+				continue
+			}
+			rows = append(rows, containerRow{
+				name:  strings.TrimPrefix(strings.TrimSpace(fields[0]), "/"),
+				image: strings.TrimSpace(fields[1]),
+				state: strings.ToLower(strings.TrimSpace(fields[2])),
+			})
+		}
+	} else {
+		// 老版本 Docker（如 CentOS 6 上的 Docker 1.x）可能不支持 --format，
+		// 回退到解析 `docker ps -a --no-trunc` 的普通输出。
+		cctx2, cancel2 := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel2()
+		plain, err2 := exec.CommandContext(cctx2, dockerBin, "ps", "-a", "--no-trunc").Output()
+		if err2 != nil {
+			return nil, nil, fmt.Errorf("docker ps failed: %v (fallback: %v)", err, err2)
+		}
+		for _, line := range strings.Split(string(plain), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 3 || strings.EqualFold(fields[0], "container") {
+				continue
+			}
+			state := "unknown"
+			joined := strings.Join(fields[3:], " ")
+			lower := strings.ToLower(joined)
+			switch {
+			case strings.HasPrefix(lower, "up "):
+				state = "running"
+			case strings.HasPrefix(lower, "exited"):
+				state = "exited"
+			case strings.HasPrefix(lower, "created"):
+				state = "created"
+			case strings.HasPrefix(lower, "paused"):
+				state = "paused"
+			case strings.HasPrefix(lower, "restarting"):
+				state = "restarting"
+			case strings.HasPrefix(lower, "dead"):
+				state = "dead"
+			}
+			rows = append(rows, containerRow{
+				name:  strings.TrimPrefix(fields[len(fields)-1], "/"),
+				image: fields[1],
+				state: state,
+			})
+		}
 	}
 
 	var services []deploymentInventoryService
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		fields := strings.Split(line, "|")
-		if len(fields) < 3 {
-			continue
-		}
-		name := strings.TrimPrefix(strings.TrimSpace(fields[0]), "/")
-		image := strings.TrimSpace(fields[1])
-		state := strings.ToLower(strings.TrimSpace(fields[2]))
+	for _, row := range rows {
+		name := row.name
+		image := row.image
+		state := row.state
 		if name == "" {
 			continue
 		}
@@ -2102,8 +2599,12 @@ func deploymentCollectCron(ctx context.Context) ([]deploymentInventoryService, [
 		}
 	}
 
-	// 3. 用户 crontab：/var/spool/cron/crontabs/*（Debian）、/var/spool/cron/*（RHEL）
-	spoolPatterns := []string{"/var/spool/cron/crontabs/*", "/var/spool/cron/*"}
+	// 3. 用户 crontab：/var/spool/cron/crontabs/*（Debian）、/var/spool/cron/*（RHEL）、/var/spool/cron/tabs/*（SUSE）
+	spoolPatterns := []string{
+		"/var/spool/cron/crontabs/*",
+		"/var/spool/cron/tabs/*",
+		"/var/spool/cron/*",
+	}
 	for _, pattern := range spoolPatterns {
 		matches, _ := filepath.Glob(deploymentHostPath(pattern))
 		for _, path := range matches {
@@ -2115,6 +2616,9 @@ func deploymentCollectCron(ctx context.Context) ([]deploymentInventoryService, [
 			crons = append(crons, deploymentParseCronFile(path, "user", userName, "spool", false)...)
 		}
 	}
+
+	// 3.1 RHEL 6 / Ubuntu 14 的 Anacron 任务
+	crons = append(crons, deploymentParseAnacrontab(deploymentHostPath("/etc/anacrontab"))...)
 
 	// 4. /etc/cron.{hourly,daily,weekly,monthly}/* 脚本
 	periods := []struct {
@@ -2254,6 +2758,56 @@ func deploymentParseCronFile(path, scope, defaultUser, source string, hasUserFie
 			Path:     path,
 			Scope:    scope,
 			Source:   source,
+		})
+	}
+	return out
+}
+
+// deploymentParseAnacrontab 解析 /etc/anacrontab（RHEL 6 / Ubuntu 14 常见）
+func deploymentParseAnacrontab(path string) []deploymentInventoryCron {
+	data, err := deploymentReadFileLimited(path, deploymentMaxFileSize)
+	if err != nil {
+		return nil
+	}
+	covered := map[string]struct{}{
+		"cron.daily": {}, "cron.weekly": {}, "cron.monthly": {},
+	}
+	var out []deploymentInventoryCron
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		eq := strings.Index(line, "=")
+		space := strings.IndexAny(line, " \t")
+		if eq > 0 && (space < 0 || eq < space) {
+			continue // SHELL/PATH/RANDOM_DELAY 等环境变量
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		period, delay, jobID := fields[0], fields[1], fields[2]
+		if _, ok := covered[jobID]; ok {
+			// /etc/cron.{daily,weekly,monthly} 已经在上面单独采集，避免重复
+			continue
+		}
+		command := strings.Join(fields[3:], " ")
+		schedule := fmt.Sprintf("@every %s days (delay %s minutes)", period, delay)
+		if strings.HasPrefix(period, "@") {
+			schedule = period
+		}
+		out = append(out, deploymentInventoryCron{
+			Name:     jobID,
+			User:     "root",
+			Schedule: schedule,
+			Command:  command,
+			Cwd:      deploymentExtractCommandCwd(command),
+			Path:     path,
+			Scope:    "system",
+			Source:   "anacrontab",
 		})
 	}
 	return out

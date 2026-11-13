@@ -9,6 +9,7 @@
 - **插件化采集器机制**：支持在 `my_collectors/` 目录下编写自定义采集器（Collector），一键自动注册，无需手动修改主程序。
 - **高性能端口-进程采集器**：自动发现监听端口与进程，检测端口/HTTP存活、响应时间，支持大规模主机高并发采集。
 - **硬件、网卡、登录失败等多种插件**：开箱即用，支持硬件信息、物理网卡、登录失败次数等常见运维指标。
+- **老系统兼容**：部署清单采集支持 RHEL/CentOS 6、SUSE 12、Ubuntu 14 的 SysV init / Upstart / systemd / Anacron。
 - **环境变量灵活配置**：所有检测周期、超时、并发、排除进程等均可通过环境变量灵活调整。
 - **官方兼容性**：构建流程、版本信息注入、产物命名等与官方 node_exporter 保持一致。
 - **CI/CD 自动化**：支持 GitHub Actions 自动注册插件、构建多平台产物、发布 Release。
@@ -122,6 +123,8 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
   - 采集已安装部署的服务、中间件、容器与定时任务清单
   - 字段包含服务名、路径、运行用户、启动方式、中间件类型、cwd、exe、root
   - 默认排除系统服务、内核线程、桌面组件与开发工具进程
+  - 支持 systemd / SysV init / Upstart / supervisor / Docker / 进程 / cron / anacron
+  - 兼容 RHEL/CentOS 6、SUSE 12、Ubuntu 14 等老系统
   - 全异步加载，默认每 24 小时刷新一次，不阻塞 `/metrics`
   - 数据源并发采集，带超时、防重入、失败回退与基数保护
   - 详见 [`my_collectors/deployment_inventory_collector.md`](my_collectors/deployment_inventory_collector.md)
@@ -149,6 +152,7 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 | `DEPLOYMENT_INVENTORY_CONCURRENCY` | 自动 | 部署清单扫描并发度 |
 | `DEPLOYMENT_INVENTORY_HOST_ROOT` | 空 | 容器采集宿主机时的宿主机根目录 |
 | `DEPLOYMENT_INVENTORY_PROC` | `PROC_PREFIX` 或 `/proc` | 部署清单使用的 /proc 路径 |
+| `DEPLOYMENT_INVENTORY_UPSTART` | `true` | 是否采集 Upstart 服务（Ubuntu 14 / RHEL 6） |
 | `DEPLOYMENT_INVENTORY_CRON_SCOPE` | `all` | 定时任务范围：`all`/`system`/`user` |
 | `DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES` | `true` | 是否包含用户会话进程 |
 | `DEPLOYMENT_INVENTORY_EXCLUDE` | 空 | 额外排除项（逗号分隔） |

@@ -18,10 +18,11 @@
 |--------|------|
 | `systemd` | 解析 `/etc/systemd/system`、`/run/systemd/system`、`/usr/local/lib/systemd/system`、`/usr/lib/systemd/system`、`/lib/systemd/system` 下的 `.service` 单元 |
 | `initd` | 扫描 `/etc/init.d`，通过 `/etc/rc*.d/S*` 判断是否启用 |
+| `upstart` | 解析 `/etc/init/*.conf` 与 `.override`，兼容 Ubuntu 14、RHEL 6 等 Upstart 系统 |
 | `supervisor` | 解析 `/etc/supervisor/supervisord.conf`、`/etc/supervisor/conf.d/*.conf`、`/etc/supervisord.conf`、`/etc/supervisord.d/*` 中的 program |
-| `docker` | 通过 `docker ps -a` 采集容器（含已停止容器） |
+| `docker` | 通过 `docker ps -a` 采集容器（含已停止容器；老版本 Docker 自动回退到普通输出解析） |
 | `process` | 并发扫描 `/proc/<pid>`，读取 `exe`、`cwd`、`root`、`cmdline`、`cgroup`、UID 等 |
-| `cron` | 解析 `/etc/crontab`、`/etc/cron.d/*`、用户 crontab、`/etc/cron.{hourly,daily,weekly,monthly}/*`、systemd timer |
+| `cron` | 解析 `/etc/crontab`、`/etc/cron.d/*`、用户 crontab、`/etc/cron.{hourly,daily,weekly,monthly}/*`、`/etc/anacrontab`、systemd timer |
 
 进程扫描会通过 cgroup 将进程关联到 systemd 单元，并与 systemd/supervisor/initd 条目合并去重。
 Docker 容器内进程默认不重复出现在进程清单中（由 `docker` 数据源统一提供）。
@@ -44,14 +45,14 @@ node_deployment_inventory_info{
 | `service_name` | 服务名（systemd 单元名去后缀、容器名、进程名或 jar 名） |
 | `service_path` | 服务路径（ExecStart、init 脚本、容器镜像等） |
 | `service_user` | 运行用户 |
-| `startup_type` | 启动方式：`systemd` / `initd` / `supervisor` / `docker` / `process` |
+| `startup_type` | 启动方式：`systemd` / `initd` / `upstart` / `supervisor` / `docker` / `process` |
 | `middleware` | 中间件类型（`nginx`、`mysql`、`redis`、`kafka` 等），未识别为 `none` |
 | `cwd` | 进程工作目录；systemd 默认 `/`，无法获取时为 `unknown` |
 | `exe` | 可执行文件路径；容器为镜像名 |
 | `root` | 进程根目录（`/proc/<pid>/root`）；容器为 `unknown` |
 | `status` | `running` / `inactive` / `exited` / `created` / `paused` / `unknown` |
 | `enabled` | 是否开机启动：`true` / `false` / `static` / `unknown` |
-| `source` | 数据来源：`systemd` / `initd` / `supervisor` / `docker` / `process` |
+| `source` | 数据来源：`systemd` / `initd` / `upstart` / `supervisor` / `docker` / `process` |
 
 ### 2.2 定时任务清单
 
@@ -70,7 +71,7 @@ node_deployment_inventory_cron_info{
 | `cwd` | 从命令中解析出的 `cd` 工作目录，未知为 `unknown` |
 | `path` | 配置文件路径 |
 | `scope` | `system` / `user` |
-| `source` | `crontab` / `cron.d` / `spool` / `cron.daily` 等 / `systemd-timer` |
+| `source` | `crontab` / `cron.d` / `spool` / `cron.daily` 等 / `anacrontab` / `systemd-timer` |
 
 ### 2.3 辅助指标
 
@@ -97,6 +98,7 @@ node_deployment_inventory_cron_info{
 | `DEPLOYMENT_INVENTORY_PROC` | `PROC_PREFIX` 或 `/proc` | `/proc` 路径，兼容容器挂载 |
 | `DEPLOYMENT_INVENTORY_SYSTEMD` | `true` | 是否采集 systemd 服务 |
 | `DEPLOYMENT_INVENTORY_INITD` | `true` | 是否采集 init.d 服务 |
+| `DEPLOYMENT_INVENTORY_UPSTART` | `true` | 是否采集 Upstart 服务（Ubuntu 14 / RHEL 6） |
 | `DEPLOYMENT_INVENTORY_SUPERVISOR` | `true` | 是否采集 supervisor 配置 |
 | `DEPLOYMENT_INVENTORY_DOCKER` | `true` | 是否采集 Docker 容器 |
 | `DEPLOYMENT_INVENTORY_PROCESS` | `true` | 是否扫描 `/proc` 进程 |
@@ -108,8 +110,27 @@ node_deployment_inventory_cron_info{
 | `DEPLOYMENT_INVENTORY_EXCLUDE` | 空 | 额外排除项，逗号分隔，按名称子串匹配 |
 | `DEPLOYMENT_INVENTORY_INCLUDE` | 空 | 强制包含项（优先级高于系统服务排除），逗号分隔 |
 
-> 建议采集宿主机时挂载 `/proc`、`/etc/systemd`、`/etc/init.d`、`/etc/supervisor`、`/etc/cron*`、
-> `/var/spool/cron`，并设置 `DEPLOYMENT_INVENTORY_HOST_ROOT` 与 `DEPLOYMENT_INVENTORY_PROC`。
+> 建议采集宿主机时挂载 `/proc`、`/etc/systemd`、`/etc/init.d`、`/etc/init`、`/etc/supervisor`、
+> `/etc/cron*`、`/var/spool/cron`，并设置 `DEPLOYMENT_INVENTORY_HOST_ROOT` 与 `DEPLOYMENT_INVENTORY_PROC`。
+
+---
+
+## 3.1 老系统兼容性
+
+| 系统 | 采集方式 | 说明 |
+|------|----------|------|
+| RHEL / CentOS 6 | SysV init + Upstart | 解析 `/etc/init.d`、`/etc/rc.d/rc*.d/S*`、`/etc/init/*.conf`、`/var/spool/cron/*`；无 systemd 时自动跳过 |
+| SUSE / SLES 12 | systemd + SysV 兼容层 | 解析 systemd 单元、`/etc/init.d/rc*.d/S*`、`/var/spool/cron/tabs/*`、`/etc/anacrontab` |
+| Ubuntu 14 | Upstart | 解析 `/etc/init/*.conf`，读取 `exec`、`script`、`setuid`、`chdir`、`start on` 与 `.override`；通过 `initctl list` 获取运行状态 |
+
+老系统上请注意：
+
+1. 使用 CI 的 **legacy 二进制**（Go 1.23 编译，支持 kernel 2.6.32–3.10）；
+2. SysV init 脚本会解析 `DAEMON`/`PROG`/`USER`/`DAEMON_USER`/`chdir`，并与 `/proc` 进程按 exe 合并，兼容“服务名与进程名不一致”的场景；
+3. 无 systemd 时 `status` 主要来自进程合并，`systemd` 数据源为空但不会报错；
+4. 老版本 Docker 不支持 `--format` 时，会自动回退解析 `docker ps -a --no-trunc` 的普通输出；
+5. Upstart 的 `initctl` 位于 `/sbin` 或 `/usr/sbin`，采集器会按绝对路径查找；
+6. 老系统 cron 可能使用 Anacron，采集器会解析 `/etc/anacrontab` 中的自定义任务。
 
 ---
 
@@ -118,7 +139,7 @@ node_deployment_inventory_cron_info{
 1. **后台刷新**：`NewDeploymentInventoryCollector` 只启动一个后台协程，首次刷新异步执行；  
    `Collect()` 仅通过 `atomic.Pointer` 读取不可变快照，抓取延迟与主机进程数无关。
 2. **每日刷新**：默认 `ticker` 周期 24 小时，刷新完成后一次性替换快照。
-3. **并发采集**：systemd/initd/supervisor/docker/process/cron 六个数据源并发执行；
+3. **并发采集**：systemd/initd/upstart/supervisor/docker/process/cron 数据源并发执行；
    systemd 单元与 `/proc` 进程均有固定大小工作池，避免 goroutine 数量失控。
 4. **超时控制**：整体刷新有 `context` 超时，`systemctl`、`supervisorctl`、`docker` 等外部命令另有 5–15 秒超时。
 5. **防重入**：`sync.Mutex.TryLock()` 保证上一轮未结束时不会重复刷新，也不会阻塞抓取。
