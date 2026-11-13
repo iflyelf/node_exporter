@@ -42,16 +42,6 @@ const (
 	deploymentDefaultTimeout = 90 * time.Second
 	// deploymentHardExtraTimeout 超时后额外等待时间，避免个别数据源卡死刷新协程
 	deploymentHardExtraTimeout = 15 * time.Second
-	// deploymentMaxServices 单次最大服务条目数，防止异常环境导致指标基数爆炸
-	deploymentMaxServices = 3000
-	// deploymentMaxCronJobs 单次最大定时任务条目数
-	deploymentMaxCronJobs = 1000
-	// deploymentMaxProcesses 最大扫描进程数
-	deploymentMaxProcesses = 10000
-	// deploymentMaxUnitFiles 最大解析 systemd 单元文件数
-	deploymentMaxUnitFiles = 5000
-	// deploymentMaxCronFiles 最大解析 cron 文件数
-	deploymentMaxCronFiles = 2000
 	// deploymentMaxFileSize 单个配置文件最大读取字节数（1 MiB）
 	deploymentMaxFileSize = 1 << 20
 	// deploymentDefaultCacheTTL 数据源刷新失败时旧缓存默认保留时间
@@ -76,22 +66,9 @@ type deploymentInventoryService struct {
 	instances int    // 进程实例数，内部合并使用
 }
 
-// deploymentInventoryCron 单条定时任务信息
-type deploymentInventoryCron struct {
-	Name     string // 任务名（文件名:行号 / systemd timer 名）
-	User     string // 执行用户
-	Schedule string // 调度表达式
-	Command  string // 执行命令
-	Cwd      string // 工作目录（从命令中的 cd 解析，未知为 unknown）
-	Path     string // 配置文件路径
-	Scope    string // system/user
-	Source   string // crontab/cron.d/spool/cron.daily/systemd-timer
-}
-
 // deploymentInventorySnapshot 只读快照，发布后不再修改
 type deploymentInventorySnapshot struct {
 	services          []deploymentInventoryService
-	crons             []deploymentInventoryCron
 	lastRefresh       time.Time
 	duration          time.Duration
 	sourceUp          map[string]float64
@@ -407,6 +384,16 @@ func deploymentTruncateLabel(value string, maxRunes int) string {
 	return string(runes[:maxRunes])
 }
 
+// deploymentServiceIdentity 服务去重身份：忽略大小写与常见单元后缀，
+// 但保留 @instance，避免把不同实例误合并。
+func deploymentServiceIdentity(name string) string {
+	identity := strings.ToLower(strings.TrimSpace(name))
+	for _, suffix := range []string{".service", ".timer", ".socket", ".sh"} {
+		identity = strings.TrimSuffix(identity, suffix)
+	}
+	return identity
+}
+
 func deploymentNormalizeServiceName(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	name = strings.TrimSuffix(name, ".service")
@@ -671,13 +658,12 @@ func startDeploymentInventoryWorker() {
 type deploymentInventorySourceResult struct {
 	name     string
 	services []deploymentInventoryService
-	crons    []deploymentInventoryCron
 	err      error
 }
 
 type deploymentInventorySource struct {
 	name    string
-	collect func(context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error)
+	collect func(context.Context) ([]deploymentInventoryService, error)
 }
 
 // deploymentInventoryCommand 创建带超时和 WaitDelay 的外部命令。
@@ -718,9 +704,6 @@ func deploymentInventorySources() []deploymentInventorySource {
 	}
 	if deploymentEnvBool("DEPLOYMENT_INVENTORY_PROCESS", true) {
 		sources = append(sources, deploymentInventorySource{name: "process", collect: deploymentCollectProcesses})
-	}
-	if deploymentEnvBool("DEPLOYMENT_INVENTORY_CRON", true) {
-		sources = append(sources, deploymentInventorySource{name: "cron", collect: deploymentCollectCron})
 	}
 	return sources
 }
@@ -765,11 +748,11 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 			// 无论是否 panic 都必须回传结果，避免刷新流程等待不到该数据源
 			defer func() {
 				if r := recover(); r != nil {
-					res.services, res.crons, res.err = nil, nil, fmt.Errorf("panic: %v", r)
+					res.services, res.err = nil, fmt.Errorf("panic: %v", r)
 				}
 				resultCh <- res
 			}()
-			res.services, res.crons, res.err = s.collect(ctx)
+			res.services, res.err = s.collect(ctx)
 		}(src, flag)
 	}
 
@@ -801,14 +784,10 @@ collectLoop:
 	cacheTTL := deploymentEnvDuration("DEPLOYMENT_INVENTORY_CACHE_TTL", deploymentDefaultCacheTTL)
 	now := time.Now()
 	prevBySource := make(map[string][]deploymentInventoryService)
-	prevCronBySource := make(map[string][]deploymentInventoryCron)
 	prevLastSuccess := make(map[string]time.Time)
 	if prev != nil {
 		for _, svc := range prev.services {
 			prevBySource[svc.Source] = append(prevBySource[svc.Source], svc)
-		}
-		for _, cj := range prev.crons {
-			prevCronBySource[cj.Source] = append(prevCronBySource[cj.Source], cj)
 		}
 		for source, last := range prev.sourceLastSuccess {
 			prevLastSuccess[source] = last
@@ -818,7 +797,6 @@ collectLoop:
 	sourceUp := make(map[string]float64, len(sources))
 	sourceLastSuccess := make(map[string]time.Time, len(sources))
 	var services []deploymentInventoryService
-	var crons []deploymentInventoryCron
 	var errCount uint64
 	var errMsgs []string
 
@@ -839,15 +817,6 @@ collectLoop:
 			}
 			if reuseCache {
 				services = append(services, prevBySource[src.name]...)
-				if src.name == "cron" {
-					// cron 条目的 Source 细分为 crontab/cron.d/systemd-timer 等，
-					// 失败回退时统一使用上一轮全部 cron 缓存。
-					if prev != nil {
-						crons = append(crons, prev.crons...)
-					}
-				} else {
-					crons = append(crons, prevCronBySource[src.name]...)
-				}
 			} else if hasSuccess {
 				log.Printf("[deployment_inventory] source %s cache expired after %s without success, drop cached data",
 					src.name, time.Since(lastSuccess).Round(time.Second))
@@ -857,15 +826,12 @@ collectLoop:
 		sourceUp[src.name] = 1
 		sourceLastSuccess[src.name] = now
 		services = append(services, res.services...)
-		crons = append(crons, res.crons...)
 	}
 
 	services = deploymentMergeServices(services)
-	crons = deploymentMergeCrons(crons)
 
 	snapshot := &deploymentInventorySnapshot{
 		services:          services,
-		crons:             crons,
 		lastRefresh:       time.Now(),
 		duration:          time.Since(start),
 		sourceUp:          sourceUp,
@@ -877,8 +843,8 @@ collectLoop:
 		deploymentInventoryRefreshErrors.Add(errCount)
 		log.Printf("[deployment_inventory] refresh completed with %d error(s): %s", errCount, strings.Join(errMsgs, "; "))
 	}
-	log.Printf("[deployment_inventory] refresh completed: services=%d cron_jobs=%d duration=%s",
-		len(snapshot.services), len(snapshot.crons), snapshot.duration.Round(time.Millisecond))
+	log.Printf("[deployment_inventory] refresh completed: services=%d duration=%s",
+		len(snapshot.services), snapshot.duration.Round(time.Millisecond))
 }
 
 // deploymentIsGenericRuntime 判断是否为通用运行时（多个业务进程可能共用同一 exe）
@@ -894,7 +860,7 @@ func deploymentIsGenericRuntime(path string) bool {
 	return false
 }
 
-// deploymentMergeServices 合并来自不同数据源的重复服务，并限制最大条目数
+// deploymentMergeServices 合并不同数据源的重复服务，并确保服务名唯一
 func deploymentMergeServices(input []deploymentInventoryService) []deploymentInventoryService {
 	if len(input) == 0 {
 		return nil
@@ -1057,6 +1023,54 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 		out = append(out, *svc)
 	}
 
+	// 先按数据源优先级排序：配置类（systemd/initd/upstart/supervisor）优先于纯进程。
+	// 这样按服务名去重时，保留配置中的启动方式/用户/路径，再用进程信息补全 cwd/exe。
+	sourcePriority := func(source string) int {
+		switch source {
+		case "systemd":
+			return 0
+		case "initd":
+			return 1
+		case "upstart":
+			return 2
+		case "supervisor":
+			return 3
+		case "process":
+			return 4
+		default:
+			return 5
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		pi, pj := sourcePriority(out[i].Source), sourcePriority(out[j].Source)
+		if pi != pj {
+			return pi < pj
+		}
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Exe < out[j].Exe
+	})
+
+	// 按服务身份去重：同名服务只保留一条，后续条目合并字段。
+	// 服务身份忽略大小写与 .service/.sh 等后缀，但保留 @instance。
+	identitySeen := make(map[string]int, len(out))
+	canonical := out[:0]
+	for i := range out {
+		svc := out[i]
+		identity := deploymentServiceIdentity(svc.Name)
+		if identity == "" {
+			identity = strings.ToLower(svc.Name)
+		}
+		if idx, ok := identitySeen[identity]; ok {
+			mergeInto(&canonical[idx], &svc)
+			continue
+		}
+		identitySeen[identity] = len(canonical)
+		canonical = append(canonical, svc)
+	}
+	out = canonical
+
 	// 按最终暴露的标签组合二次去重：不同 dedupKey 的进程可能产生完全相同的标签，
 	// 若不合并 Prometheus 会因重复指标导致整个 /metrics 采集失败。
 	labelSeen := make(map[string]int, len(out))
@@ -1085,70 +1099,6 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 		return out[i].Exe < out[j].Exe
 	})
 
-	maxServices := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_SERVICES", deploymentMaxServices)
-	if len(out) > maxServices {
-		log.Printf("[deployment_inventory] too many services (%d), truncated to %d", len(out), maxServices)
-		out = out[:maxServices]
-	}
-	return out
-}
-
-// deploymentMergeCrons 去重并限制定时任务条目数
-func deploymentMergeCrons(input []deploymentInventoryCron) []deploymentInventoryCron {
-	if len(input) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(input))
-	out := make([]deploymentInventoryCron, 0, len(input))
-	for _, cj := range input {
-		if cj.Cwd == "" {
-			cj.Cwd = "unknown"
-		}
-		if cj.User == "" {
-			cj.User = "unknown"
-		}
-		cj.Name = deploymentTruncateLabel(cj.Name, 256)
-		cj.User = deploymentTruncateLabel(cj.User, 128)
-		cj.Schedule = deploymentTruncateLabel(cj.Schedule, 512)
-		cj.Command = deploymentTruncateLabel(cj.Command, 2048)
-		cj.Cwd = deploymentTruncateLabel(cj.Cwd, 1024)
-		cj.Path = deploymentTruncateLabel(cj.Path, 1024)
-		cj.Scope = deploymentTruncateLabel(cj.Scope, 32)
-		cj.Source = deploymentTruncateLabel(cj.Source, 64)
-		key := cj.Source + "|" + cj.Name + "|" + cj.Schedule + "|" + cj.Command + "|" + cj.User
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, cj)
-	}
-
-	// 按最终标签组合去重，避免重复指标导致 /metrics 采集失败
-	labelSeen := make(map[string]struct{}, len(out))
-	deduped := out[:0]
-	for _, cj := range out {
-		labelKey := strings.Join([]string{
-			cj.Name, cj.User, cj.Schedule, cj.Command, cj.Cwd, cj.Path, cj.Scope, cj.Source,
-		}, "\x00")
-		if _, ok := labelSeen[labelKey]; ok {
-			continue
-		}
-		labelSeen[labelKey] = struct{}{}
-		deduped = append(deduped, cj)
-	}
-	out = deduped
-
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Name != out[j].Name {
-			return out[i].Name < out[j].Name
-		}
-		return out[i].Source < out[j].Source
-	})
-	maxCronJobs := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_CRON_JOBS", deploymentMaxCronJobs)
-	if len(out) > maxCronJobs {
-		log.Printf("[deployment_inventory] too many cron jobs (%d), truncated to %d", len(out), maxCronJobs)
-		out = out[:maxCronJobs]
-	}
 	return out
 }
 
@@ -1377,10 +1327,10 @@ func deploymentParseExecStart(value string) string {
 }
 
 // deploymentCollectSystemd 采集 systemd 服务
-func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService, error) {
 	dirs := deploymentSystemdUnitDirs()
 	if len(dirs) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	enabled := deploymentSystemdEnabledUnits(dirs)
@@ -1410,11 +1360,6 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 		}
 	}
 
-	maxUnits := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_UNIT_FILES", deploymentMaxUnitFiles)
-	if len(unitMap) > maxUnits {
-		log.Printf("[deployment_inventory] too many systemd units (%d), truncated to %d", len(unitMap), maxUnits)
-	}
-
 	concurrency := deploymentInventoryConcurrency()
 	type unitResult struct {
 		svc *deploymentInventoryService
@@ -1440,14 +1385,9 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 
 	go func() {
 		defer close(jobs)
-		count := 0
 		for _, unit := range unitMap {
-			if count >= maxUnits {
-				break
-			}
 			select {
 			case jobs <- unit:
-				count++
 			case <-ctx.Done():
 				return
 			}
@@ -1466,9 +1406,9 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return services, nil, err
+		return services, err
 	}
-	return services, nil, nil
+	return services, nil
 }
 
 func deploymentBuildSystemdService(unitName, unitPath string, custom bool, enabled, running map[string]bool, haveRunning bool) (*deploymentInventoryService, error) {
@@ -1536,11 +1476,11 @@ func deploymentBuildSystemdService(unitName, unitPath string, custom bool, enabl
 // 数据源：SysV init.d
 // ==========================================================================
 
-func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, error) {
 	initDir := deploymentHostPath("/etc/init.d")
 	entries, err := os.ReadDir(initDir)
 	if err != nil {
-		return nil, nil, nil // 目录不存在视为无数据，不报错
+		return nil, nil // 目录不存在视为无数据，不报错
 	}
 
 	enabled := make(map[string]bool)
@@ -1615,9 +1555,9 @@ func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, 
 		})
 	}
 	if err := ctx.Err(); err != nil {
-		return services, nil, err
+		return services, err
 	}
-	return services, nil, nil
+	return services, nil
 }
 
 // deploymentParseInitdScript 从 SysV init 脚本中提取可执行文件、运行用户、工作目录
@@ -1902,18 +1842,18 @@ func deploymentUpstartStatus(ctx context.Context) (map[string]string, bool) {
 	return status, true
 }
 
-func deploymentCollectUpstart(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+func deploymentCollectUpstart(ctx context.Context) ([]deploymentInventoryService, error) {
 	initDir := deploymentHostPath("/etc/init")
 	entries, err := os.ReadDir(initDir)
 	if err != nil {
-		return nil, nil, nil // 非 Upstart 系统视为无数据
+		return nil, nil // 非 Upstart 系统视为无数据
 	}
 	statusMap, statusKnown := deploymentUpstartStatus(ctx)
 
 	var services []deploymentInventoryService
 	for _, entry := range entries {
 		if ctx.Err() != nil {
-			return services, nil, ctx.Err()
+			return services, ctx.Err()
 		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
 			continue
@@ -1972,7 +1912,7 @@ func deploymentCollectUpstart(ctx context.Context) ([]deploymentInventoryService
 			instances:   0,
 		})
 	}
-	return services, nil, nil
+	return services, nil
 }
 
 // ==========================================================================
@@ -2002,10 +1942,10 @@ func deploymentSupervisorConfigFiles() []string {
 	return files
 }
 
-func deploymentCollectSupervisor(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+func deploymentCollectSupervisor(ctx context.Context) ([]deploymentInventoryService, error) {
 	files := deploymentSupervisorConfigFiles()
 	if len(files) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	// 解析 include 配置
@@ -2085,9 +2025,9 @@ func deploymentCollectSupervisor(ctx context.Context) ([]deploymentInventoryServ
 		})
 	}
 	if err := ctx.Err(); err != nil {
-		return services, nil, err
+		return services, err
 	}
-	return services, nil, nil
+	return services, nil
 }
 
 func deploymentParseSupervisorIncludes(path string) []string {
@@ -2417,15 +2357,14 @@ func deploymentShouldSkipContainerProcess() bool {
 }
 
 // deploymentCollectProcesses 并发扫描 /proc，构建进程级部署清单
-func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryService, error) {
 	procRoot := deploymentProcRoot()
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read %s failed: %w", procRoot, err)
+		return nil, fmt.Errorf("read %s failed: %w", procRoot, err)
 	}
 
 	pids := make([]int, 0, len(entries))
-	maxProcesses := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_PROCESSES", deploymentMaxProcesses)
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -2435,9 +2374,6 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 			continue
 		}
 		pids = append(pids, pid)
-		if len(pids) >= maxProcesses {
-			break
-		}
 	}
 
 	skipContainer := deploymentShouldSkipContainerProcess()
@@ -2493,15 +2429,15 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
-			return deploymentProcessGroupsToSlice(groups), nil, ctx.Err()
+			return deploymentProcessGroupsToSlice(groups), ctx.Err()
 		}
 	}
 	close(jobs)
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
-		return deploymentProcessGroupsToSlice(groups), nil, err
+		return deploymentProcessGroupsToSlice(groups), err
 	}
-	return deploymentProcessGroupsToSlice(groups), nil, nil
+	return deploymentProcessGroupsToSlice(groups), nil
 }
 
 func deploymentProcessGroupsToSlice(groups map[string]*deploymentInventoryService) []deploymentInventoryService {
@@ -2636,357 +2572,13 @@ func deploymentDeriveProcessName(comm, cmdline, exe string) string {
 }
 
 // ==========================================================================
-// 数据源：定时任务
-// ==========================================================================
-
-func deploymentCollectCron(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
-	var crons []deploymentInventoryCron
-	maxCronFiles := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_CRON_FILES", deploymentMaxCronFiles)
-
-	// 1. /etc/crontab（系统级，含 user 字段）
-	crons = append(crons, deploymentParseCronFile(deploymentHostPath("/etc/crontab"), "system", "", "crontab", true)...)
-
-	// 2. /etc/cron.d/*（系统级，含 user 字段）
-	if matches, _ := filepath.Glob(deploymentHostPath("/etc/cron.d/*")); len(matches) > 0 {
-		sort.Strings(matches)
-		for _, path := range matches {
-			if len(crons) >= maxCronFiles {
-				break
-			}
-			info, err := os.Stat(path)
-			if err != nil || info.IsDir() {
-				continue
-			}
-			crons = append(crons, deploymentParseCronFile(path, "system", "", "cron.d", true)...)
-		}
-	}
-
-	// 3. 用户 crontab：/var/spool/cron/crontabs/*（Debian）、/var/spool/cron/*（RHEL）、/var/spool/cron/tabs/*（SUSE）
-	spoolPatterns := []string{
-		"/var/spool/cron/crontabs/*",
-		"/var/spool/cron/tabs/*",
-		"/var/spool/cron/*",
-	}
-	for _, pattern := range spoolPatterns {
-		matches, _ := filepath.Glob(deploymentHostPath(pattern))
-		for _, path := range matches {
-			info, err := os.Stat(path)
-			if err != nil || info.IsDir() {
-				continue
-			}
-			userName := filepath.Base(path)
-			crons = append(crons, deploymentParseCronFile(path, "user", userName, "spool", false)...)
-		}
-	}
-
-	// 3.1 RHEL 6 / Ubuntu 14 的 Anacron 任务
-	crons = append(crons, deploymentParseAnacrontab(deploymentHostPath("/etc/anacrontab"))...)
-
-	// 4. /etc/cron.{hourly,daily,weekly,monthly}/* 脚本
-	periods := []struct {
-		dir      string
-		schedule string
-	}{
-		{"/etc/cron.hourly", "@hourly"},
-		{"/etc/cron.daily", "@daily"},
-		{"/etc/cron.weekly", "@weekly"},
-		{"/etc/cron.monthly", "@monthly"},
-	}
-	for _, period := range periods {
-		entries, err := os.ReadDir(deploymentHostPath(period.dir))
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if ctx.Err() != nil {
-				break
-			}
-			if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-				continue
-			}
-			path := filepath.Join(deploymentHostPath(period.dir), entry.Name())
-			crons = append(crons, deploymentInventoryCron{
-				Name:     entry.Name(),
-				User:     "root",
-				Schedule: period.schedule,
-				Command:  path,
-				Cwd:      "unknown",
-				Path:     path,
-				Scope:    "system",
-				Source:   "cron." + strings.TrimPrefix(period.schedule, "@"),
-			})
-		}
-	}
-
-	// 5. systemd timer
-	crons = append(crons, deploymentCollectSystemdTimers(ctx)...)
-
-	if err := ctx.Err(); err != nil {
-		return nil, crons, err
-	}
-
-	// 可选：按 scope 过滤定时任务（all/user/system），默认 all
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_CRON_SCOPE"))) {
-	case "user":
-		filtered := crons[:0]
-		for _, cj := range crons {
-			if cj.Scope == "user" {
-				filtered = append(filtered, cj)
-			}
-		}
-		crons = filtered
-	case "system":
-		filtered := crons[:0]
-		for _, cj := range crons {
-			if cj.Scope == "system" {
-				filtered = append(filtered, cj)
-			}
-		}
-		crons = filtered
-	}
-
-	return nil, crons, nil
-}
-
-func deploymentParseCronFile(path, scope, defaultUser, source string, hasUserField bool) []deploymentInventoryCron {
-	data, err := deploymentReadFileLimited(path, deploymentMaxFileSize)
-	if err != nil {
-		return nil
-	}
-	var out []deploymentInventoryCron
-	lineNo := 0
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		// 跳过环境变量行，如 SHELL=/bin/sh、MAILTO=""
-		eq := strings.Index(line, "=")
-		space := strings.IndexAny(line, " \t")
-		if eq > 0 && (space < 0 || eq < space) {
-			continue
-		}
-
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-
-		var schedule, userName, command string
-		if strings.HasPrefix(fields[0], "@") {
-			schedule = fields[0]
-			if hasUserField {
-				if len(fields) < 3 {
-					continue
-				}
-				userName = fields[1]
-				command = strings.Join(fields[2:], " ")
-			} else {
-				userName = defaultUser
-				command = strings.Join(fields[1:], " ")
-			}
-		} else {
-			if len(fields) < 6 {
-				continue
-			}
-			schedule = strings.Join(fields[:5], " ")
-			if hasUserField {
-				if len(fields) < 7 {
-					continue
-				}
-				userName = fields[5]
-				command = strings.Join(fields[6:], " ")
-			} else {
-				userName = defaultUser
-				command = strings.Join(fields[5:], " ")
-			}
-		}
-		if userName == "" {
-			userName = defaultUser
-		}
-		if command == "" {
-			continue
-		}
-
-		out = append(out, deploymentInventoryCron{
-			Name:     fmt.Sprintf("%s:%d", filepath.Base(path), lineNo),
-			User:     userName,
-			Schedule: schedule,
-			Command:  command,
-			Cwd:      deploymentExtractCommandCwd(command),
-			Path:     path,
-			Scope:    scope,
-			Source:   source,
-		})
-	}
-	return out
-}
-
-// deploymentParseAnacrontab 解析 /etc/anacrontab（RHEL 6 / Ubuntu 14 常见）
-func deploymentParseAnacrontab(path string) []deploymentInventoryCron {
-	data, err := deploymentReadFileLimited(path, deploymentMaxFileSize)
-	if err != nil {
-		return nil
-	}
-	covered := map[string]struct{}{
-		"cron.daily": {}, "cron.weekly": {}, "cron.monthly": {},
-	}
-	var out []deploymentInventoryCron
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		eq := strings.Index(line, "=")
-		space := strings.IndexAny(line, " \t")
-		if eq > 0 && (space < 0 || eq < space) {
-			continue // SHELL/PATH/RANDOM_DELAY 等环境变量
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
-		}
-		period, delay, jobID := fields[0], fields[1], fields[2]
-		if _, ok := covered[jobID]; ok {
-			// /etc/cron.{daily,weekly,monthly} 已经在上面单独采集，避免重复
-			continue
-		}
-		command := strings.Join(fields[3:], " ")
-		schedule := fmt.Sprintf("@every %s days (delay %s minutes)", period, delay)
-		if strings.HasPrefix(period, "@") {
-			schedule = period
-		}
-		out = append(out, deploymentInventoryCron{
-			Name:     jobID,
-			User:     "root",
-			Schedule: schedule,
-			Command:  command,
-			Cwd:      deploymentExtractCommandCwd(command),
-			Path:     path,
-			Scope:    "system",
-			Source:   "anacrontab",
-		})
-	}
-	return out
-}
-
-// deploymentExtractCommandCwd 从 cron 命令中提取 cd 的工作目录
-func deploymentExtractCommandCwd(command string) string {
-	trimmed := strings.TrimSpace(command)
-	for _, prefix := range []string{"cd ", "cd\t"} {
-		if strings.HasPrefix(trimmed, prefix) {
-			rest := strings.TrimSpace(trimmed[len(prefix):])
-			idx := strings.IndexAny(rest, ";&|")
-			if idx >= 0 {
-				rest = rest[:idx]
-			}
-			dir := strings.Trim(strings.TrimSpace(rest), `"'`)
-			if dir != "" {
-				return dir
-			}
-		}
-	}
-	return "unknown"
-}
-
-// deploymentCollectSystemdTimers 采集 systemd timer（同时考虑 enabled / 自定义单元）
-func deploymentCollectSystemdTimers(ctx context.Context) []deploymentInventoryCron {
-	dirs := deploymentSystemdUnitDirs()
-	if len(dirs) == 0 {
-		return nil
-	}
-	enabled := deploymentSystemdEnabledUnits(dirs)
-	timerMap := make(map[string]struct {
-		path   string
-		custom bool
-	})
-	for _, dir := range dirs {
-		entries, err := os.ReadDir(dir.path)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			name := entry.Name()
-			if !strings.HasSuffix(name, ".timer") || strings.Contains(name, "@.") {
-				continue
-			}
-			if _, ok := timerMap[name]; ok {
-				continue
-			}
-			timerMap[name] = struct {
-				path   string
-				custom bool
-			}{path: filepath.Join(dir.path, name), custom: dir.custom}
-		}
-	}
-
-	var out []deploymentInventoryCron
-	for name, timer := range timerMap {
-		if ctx.Err() != nil {
-			break
-		}
-		base := strings.TrimSuffix(name, ".timer")
-		if deploymentIsSystemService(base) {
-			continue
-		}
-		cfg, err := deploymentParseUnitFile(timer.path)
-		if err != nil {
-			continue
-		}
-		middleware := deploymentDetectMiddleware(base, cfg.exec, "", "")
-		if !timer.custom && !enabled[name] && middleware == "none" {
-			continue
-		}
-
-		scheduleParts := append([]string(nil), cfg.onCalendar...)
-		if cfg.onBootSec != "" {
-			scheduleParts = append(scheduleParts, "OnBootSec="+cfg.onBootSec)
-		}
-		if cfg.onUnitActiveSec != "" {
-			scheduleParts = append(scheduleParts, "OnUnitActiveSec="+cfg.onUnitActiveSec)
-		}
-		schedule := strings.Join(scheduleParts, " ")
-		if schedule == "" {
-			schedule = "unknown"
-		}
-		serviceUnit := cfg.timerUnit
-		if serviceUnit == "" {
-			serviceUnit = base + ".service"
-		}
-		userName := "root"
-		servicePath := filepath.Join(filepath.Dir(timer.path), serviceUnit)
-		if svcCfg, err := deploymentParseUnitFile(servicePath); err == nil && svcCfg.user != "" {
-			userName = svcCfg.user
-		}
-		out = append(out, deploymentInventoryCron{
-			Name:     base,
-			User:     userName,
-			Schedule: schedule,
-			Command:  serviceUnit,
-			Cwd:      "unknown",
-			Path:     timer.path,
-			Scope:    "system",
-			Source:   "systemd-timer",
-		})
-	}
-	return out
-}
-
-// ==========================================================================
 // Prometheus Collector
 // ==========================================================================
 
 // DeploymentInventoryCollector 主机部署清单采集器
 type DeploymentInventoryCollector struct {
 	serviceInfoDesc       *prometheus.Desc
-	cronInfoDesc          *prometheus.Desc
 	servicesTotalDesc     *prometheus.Desc
-	cronTotalDesc         *prometheus.Desc
 	lastRefreshDesc       *prometheus.Desc
 	refreshDurationDesc   *prometheus.Desc
 	refreshErrorsDesc     *prometheus.Desc
@@ -3007,18 +2599,9 @@ func NewDeploymentInventoryCollector() *DeploymentInventoryCollector {
 				"middleware", "cwd", "exe", "root", "status", "enabled", "source",
 			}, nil,
 		),
-		cronInfoDesc: prometheus.NewDesc(
-			"node_deployment_inventory_cron_info",
-			"主机定时任务清单（值恒为1）",
-			[]string{"name", "user", "schedule", "command", "cwd", "path", "scope", "source"}, nil,
-		),
 		servicesTotalDesc: prometheus.NewDesc(
 			"node_deployment_inventory_services_total",
 			"主机部署清单中的服务/中间件总数", nil, nil,
-		),
-		cronTotalDesc: prometheus.NewDesc(
-			"node_deployment_inventory_cron_jobs_total",
-			"主机部署清单中的定时任务总数", nil, nil,
 		),
 		lastRefreshDesc: prometheus.NewDesc(
 			"node_deployment_inventory_last_refresh_timestamp_seconds",
@@ -3052,9 +2635,7 @@ func NewDeploymentInventoryCollector() *DeploymentInventoryCollector {
 // Describe 实现 prometheus.Collector 接口
 func (c *DeploymentInventoryCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.serviceInfoDesc
-	ch <- c.cronInfoDesc
 	ch <- c.servicesTotalDesc
-	ch <- c.cronTotalDesc
 	ch <- c.lastRefreshDesc
 	ch <- c.refreshDurationDesc
 	ch <- c.refreshErrorsDesc
@@ -3069,7 +2650,6 @@ func (c *DeploymentInventoryCollector) Collect(ch chan<- prometheus.Metric) {
 	if snapshot == nil {
 		ch <- prometheus.MustNewConstMetric(c.readyDesc, prometheus.GaugeValue, 0)
 		ch <- prometheus.MustNewConstMetric(c.servicesTotalDesc, prometheus.GaugeValue, 0)
-		ch <- prometheus.MustNewConstMetric(c.cronTotalDesc, prometheus.GaugeValue, 0)
 		ch <- prometheus.MustNewConstMetric(c.lastRefreshDesc, prometheus.GaugeValue, 0)
 		ch <- prometheus.MustNewConstMetric(c.refreshDurationDesc, prometheus.GaugeValue, 0)
 		ch <- prometheus.MustNewConstMetric(c.refreshErrorsDesc, prometheus.CounterValue, float64(deploymentInventoryRefreshErrors.Load()))
@@ -3096,24 +2676,7 @@ func (c *DeploymentInventoryCollector) Collect(ch chan<- prometheus.Metric) {
 			svc.Source,
 		)
 	}
-	for _, cj := range snapshot.crons {
-		ch <- prometheus.MustNewConstMetric(
-			c.cronInfoDesc,
-			prometheus.GaugeValue,
-			1,
-			cj.Name,
-			cj.User,
-			cj.Schedule,
-			cj.Command,
-			cj.Cwd,
-			cj.Path,
-			cj.Scope,
-			cj.Source,
-		)
-	}
-
 	ch <- prometheus.MustNewConstMetric(c.servicesTotalDesc, prometheus.GaugeValue, float64(len(snapshot.services)))
-	ch <- prometheus.MustNewConstMetric(c.cronTotalDesc, prometheus.GaugeValue, float64(len(snapshot.crons)))
 	ch <- prometheus.MustNewConstMetric(c.lastRefreshDesc, prometheus.GaugeValue, float64(snapshot.lastRefresh.Unix()))
 	ch <- prometheus.MustNewConstMetric(c.refreshDurationDesc, prometheus.GaugeValue, snapshot.duration.Seconds())
 	ch <- prometheus.MustNewConstMetric(c.refreshErrorsDesc, prometheus.CounterValue, float64(deploymentInventoryRefreshErrors.Load()))
