@@ -123,7 +123,8 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
   - 采集已安装部署的服务、中间件、容器与定时任务清单
   - 字段包含服务名、路径、运行用户、启动方式、中间件类型、cwd、exe、root
   - 默认排除系统服务、内核线程、桌面组件与开发工具进程
-  - 支持 systemd / SysV init / Upstart / supervisor / Docker / 进程 / cron / anacron
+  - 支持 systemd / SysV init / Upstart / supervisor / 进程 / cron / anacron
+  - 默认不采集 Docker / Kubernetes 容器，容器进程默认跳过，避免高基数与卡死
   - 兼容 RHEL/CentOS 6、SUSE 12、Ubuntu 14 等老系统
   - 全异步加载，默认每 24 小时刷新一次，不阻塞 `/metrics`
   - 数据源并发采集，带超时、卡死跳过、缓存过期与基数保护
@@ -153,6 +154,8 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 | `DEPLOYMENT_INVENTORY_HOST_ROOT` | 空 | 容器采集宿主机时的宿主机根目录 |
 | `DEPLOYMENT_INVENTORY_PROC` | `PROC_PREFIX` 或 `/proc` | 部署清单使用的 /proc 路径 |
 | `DEPLOYMENT_INVENTORY_UPSTART` | `true` | 是否采集 Upstart 服务（Ubuntu 14 / RHEL 6） |
+| `DEPLOYMENT_INVENTORY_PROC_LINKS` | `auto` | 网络文件系统下跳过 exe/cwd/root 链接读取 |
+| `DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES` | `false` | 是否采集容器 cgroup 内进程 |
 | `DEPLOYMENT_INVENTORY_CRON_SCOPE` | `all` | 定时任务范围：`all`/`system`/`user` |
 | `DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES` | `true` | 是否包含用户会话进程 |
 | `DEPLOYMENT_INVENTORY_EXCLUDE` | 空 | 额外排除项（逗号分隔） |

@@ -60,17 +60,17 @@ const (
 
 // deploymentInventoryService 单条服务/中间件部署信息
 type deploymentInventoryService struct {
-	Name        string // 服务名（systemd 单元名去掉 .service、容器名、进程名等）
-	Path        string // 服务路径（ExecStart、init 脚本、容器镜像等）
+	Name        string // 服务名（systemd 单元名去掉 .service、进程名等）
+	Path        string // 服务路径（ExecStart、init/upstart 脚本、可执行文件等）
 	User        string // 运行用户
-	StartupType string // 启动方式：systemd/initd/supervisor/docker/process
+	StartupType string // 启动方式：systemd/initd/upstart/supervisor/process
 	Middleware  string // 中间件类型，未识别为 none
 	Cwd         string // 进程工作目录
 	Exe         string // 可执行文件路径
 	Root        string // 进程根目录
-	Status      string // 运行状态：running/inactive/exited/unknown
+	Status      string // 运行状态：running/inactive/unknown
 	Enabled     string // 是否开机启动：true/false/static/unknown
-	Source      string // 数据来源：systemd/initd/supervisor/docker/process
+	Source      string // 数据来源：systemd/initd/upstart/supervisor/process
 
 	dedupKey  string // 内部去重键，不对外暴露
 	instances int    // 进程实例数，内部合并使用
@@ -716,9 +716,6 @@ func deploymentInventorySources() []deploymentInventorySource {
 	if deploymentEnvBool("DEPLOYMENT_INVENTORY_SUPERVISOR", true) {
 		sources = append(sources, deploymentInventorySource{name: "supervisor", collect: deploymentCollectSupervisor})
 	}
-	if deploymentEnvBool("DEPLOYMENT_INVENTORY_DOCKER", true) {
-		sources = append(sources, deploymentInventorySource{name: "docker", collect: deploymentCollectDocker})
-	}
 	if deploymentEnvBool("DEPLOYMENT_INVENTORY_PROCESS", true) {
 		sources = append(sources, deploymentInventorySource{name: "process", collect: deploymentCollectProcesses})
 	}
@@ -945,7 +942,7 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 		dst.instances += src.instances
 	}
 
-	// 第一轮：配置类数据源（systemd/initd/supervisor/docker）优先
+	// 第一轮：配置类数据源（systemd/initd/upstart/supervisor）优先
 	for i := range input {
 		svc := input[i]
 		if svc.Source == "process" {
@@ -2216,122 +2213,6 @@ func deploymentSupervisorStatus(ctx context.Context) map[string]string {
 }
 
 // ==========================================================================
-// 数据源：docker
-// ==========================================================================
-
-func deploymentCollectDocker(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
-	dockerBin, err := exec.LookPath("docker")
-	if err != nil {
-		return nil, nil, nil // 未安装 docker 视为无数据
-	}
-
-	format := `{{.Names}}|{{.Image}}|{{.State}}|{{.Label "com.docker.compose.project"}}`
-	cmd, cancel := deploymentInventoryCommand(ctx, 15*time.Second, dockerBin, "ps", "-a", "--format", format)
-	defer cancel()
-	out, err := cmd.Output()
-
-	type containerRow struct {
-		name  string
-		image string
-		state string
-	}
-	var rows []containerRow
-
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			fields := strings.Split(line, "|")
-			if len(fields) < 3 {
-				continue
-			}
-			rows = append(rows, containerRow{
-				name:  strings.TrimPrefix(strings.TrimSpace(fields[0]), "/"),
-				image: strings.TrimSpace(fields[1]),
-				state: strings.ToLower(strings.TrimSpace(fields[2])),
-			})
-		}
-	} else {
-		// 老版本 Docker（如 CentOS 6 上的 Docker 1.x）可能不支持 --format，
-		// 回退到解析 `docker ps -a --no-trunc` 的普通输出。
-		cmd2, cancel2 := deploymentInventoryCommand(ctx, 15*time.Second, dockerBin, "ps", "-a", "--no-trunc")
-		defer cancel2()
-		plain, err2 := cmd2.Output()
-		if err2 != nil {
-			return nil, nil, fmt.Errorf("docker ps failed: %v (fallback: %v)", err, err2)
-		}
-		for _, line := range strings.Split(string(plain), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 3 || strings.EqualFold(fields[0], "container") {
-				continue
-			}
-			state := "unknown"
-			joined := strings.Join(fields[3:], " ")
-			lower := strings.ToLower(joined)
-			switch {
-			case strings.HasPrefix(lower, "up "):
-				state = "running"
-			case strings.HasPrefix(lower, "exited"):
-				state = "exited"
-			case strings.HasPrefix(lower, "created"):
-				state = "created"
-			case strings.HasPrefix(lower, "paused"):
-				state = "paused"
-			case strings.HasPrefix(lower, "restarting"):
-				state = "restarting"
-			case strings.HasPrefix(lower, "dead"):
-				state = "dead"
-			}
-			rows = append(rows, containerRow{
-				name:  strings.TrimPrefix(fields[len(fields)-1], "/"),
-				image: fields[1],
-				state: state,
-			})
-		}
-	}
-
-	var services []deploymentInventoryService
-	for _, row := range rows {
-		name := row.name
-		image := row.image
-		state := row.state
-		if name == "" {
-			continue
-		}
-		status := state
-		switch state {
-		case "running":
-			status = "running"
-		case "exited", "created", "paused", "restarting", "dead", "removing":
-			// 保持 docker 原始状态
-		default:
-			status = "unknown"
-		}
-		services = append(services, deploymentInventoryService{
-			Name:        name,
-			Path:        image,
-			User:        "unknown",
-			StartupType: "docker",
-			Middleware:  deploymentDetectMiddleware(name, image, "", image),
-			Cwd:         "unknown",
-			Exe:         image,
-			Root:        "unknown",
-			Status:      status,
-			Enabled:     "true",
-			Source:      "docker",
-			dedupKey:    "docker:" + name,
-			instances:   1,
-		})
-	}
-	if err := ctx.Err(); err != nil {
-		return services, nil, err
-	}
-	return services, nil, nil
-}
-
-// ==========================================================================
 // 数据源：进程
 // ==========================================================================
 
@@ -2350,9 +2231,82 @@ type deploymentProcessInfo struct {
 	container string
 }
 
-func deploymentReadProcess(procRoot string, pid int) (*deploymentProcessInfo, bool) {
+// deploymentProcLinkMode 返回 /proc/<pid>/{exe,cwd,root} 读取策略：
+// all=全部读取；none=不读取；auto=发现 NFS/Ceph 等网络文件系统时跳过（默认）。
+func deploymentProcLinkMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_PROC_LINKS"))) {
+	case "all":
+		return "all"
+	case "none":
+		return "none"
+	default:
+		return "auto"
+	}
+}
+
+// deploymentIsNetworkFSType 判断挂载类型是否可能因网络存储挂死
+func deploymentIsNetworkFSType(fstype string) bool {
+	lower := strings.ToLower(strings.TrimSpace(fstype))
+	for _, needle := range []string{
+		"nfs", "ceph", "cifs", "smb", "gluster", "fuse", "lustre", "9p",
+		"afs", "davfs", "ncpfs", "gpfs", "beegfs", "juicefs", "alluxio",
+		"cvmfs", "s3fs", "ocfs2", "gfs2",
+	} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// deploymentProcessHasNetworkFS 检查进程 mount namespace 是否包含网络文件系统
+func deploymentProcessHasNetworkFS(procRoot string, pid int) bool {
+	path := filepath.Join(procRoot, strconv.Itoa(pid), "mountinfo")
+	data, err := deploymentReadFileLimited(path, 512*1024)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		separator := -1
+		for i, field := range fields {
+			if field == "-" {
+				separator = i
+				break
+			}
+		}
+		if separator >= 0 && separator+1 < len(fields) && deploymentIsNetworkFSType(fields[separator+1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func deploymentExeFromCmdline(cmdline string) string {
+	fields := strings.Fields(cmdline)
+	if len(fields) == 0 {
+		return ""
+	}
+	first := strings.Trim(fields[0], `"'`)
+	if strings.HasPrefix(first, "/") {
+		return deploymentCleanProcPath(first)
+	}
+	return ""
+}
+
+func deploymentReadProcess(procRoot string, pid int, skipContainer bool) (*deploymentProcessInfo, bool) {
 	base := filepath.Join(procRoot, strconv.Itoa(pid))
 	info := &deploymentProcessInfo{pid: pid}
+
+	// 先读 cgroup：容器内进程默认在读取 comm/cmdline/mountinfo/readlink 之前就跳过，
+	// 避免 Kubernetes/Docker 节点上成千上万个容器进程造成额外 I/O 和卡死风险。
+	if data, err := deploymentReadFileLimited(filepath.Join(base, "cgroup"), 64*1024); err == nil {
+		info.cgroup = string(data)
+		info.unit, info.container = deploymentParseCgroup(string(data))
+	}
+	if skipContainer && info.container != "" {
+		return nil, false
+	}
 
 	if data, err := deploymentReadFileLimited(filepath.Join(base, "comm"), 4096); err == nil {
 		info.name = strings.TrimSpace(string(data))
@@ -2360,14 +2314,32 @@ func deploymentReadProcess(procRoot string, pid int) (*deploymentProcessInfo, bo
 	if data, err := deploymentReadFileLimited(filepath.Join(base, "cmdline"), 64*1024); err == nil {
 		info.cmdline = strings.TrimSpace(strings.ReplaceAll(string(data), "\x00", " "))
 	}
-	if link, err := os.Readlink(filepath.Join(base, "exe")); err == nil {
-		info.exe = deploymentCleanProcPath(link)
+
+	// 默认 auto：进程挂载了 NFS/Ceph 等网络文件系统时，不读取 exe/cwd/root 链接，
+	// 避免 readlink 进入挂死的网络存储导致采集线程卡在 D 状态。
+	linksAllowed := true
+	switch deploymentProcLinkMode() {
+	case "none":
+		linksAllowed = false
+	case "all":
+		linksAllowed = true
+	default:
+		linksAllowed = !deploymentProcessHasNetworkFS(procRoot, pid)
 	}
-	if link, err := os.Readlink(filepath.Join(base, "cwd")); err == nil {
-		info.cwd = deploymentCleanProcPath(link)
+	if linksAllowed {
+		if link, err := os.Readlink(filepath.Join(base, "exe")); err == nil {
+			info.exe = deploymentCleanProcPath(link)
+		}
+		if link, err := os.Readlink(filepath.Join(base, "cwd")); err == nil {
+			info.cwd = deploymentCleanProcPath(link)
+		}
+		if link, err := os.Readlink(filepath.Join(base, "root")); err == nil {
+			info.root = deploymentCleanProcPath(link)
+		}
 	}
-	if link, err := os.Readlink(filepath.Join(base, "root")); err == nil {
-		info.root = deploymentCleanProcPath(link)
+	if info.exe == "" {
+		// 跳过 readlink 时仍可从 cmdline 获取可执行文件路径（只读 /proc，不触碰业务存储）
+		info.exe = deploymentExeFromCmdline(info.cmdline)
 	}
 	if data, err := deploymentReadFileLimited(filepath.Join(base, "status"), 64*1024); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
@@ -2381,10 +2353,6 @@ func deploymentReadProcess(procRoot string, pid int) (*deploymentProcessInfo, bo
 				break
 			}
 		}
-	}
-	if data, err := deploymentReadFileLimited(filepath.Join(base, "cgroup"), 64*1024); err == nil {
-		info.cgroup = string(data)
-		info.unit, info.container = deploymentParseCgroup(string(data))
 	}
 
 	if info.name == "" {
@@ -2408,8 +2376,12 @@ func deploymentParseCgroup(cgroup string) (unit, container string) {
 		parts := strings.SplitN(line, ":", 3)
 		path := parts[len(parts)-1]
 		lower := strings.ToLower(path)
-		if strings.Contains(lower, "/docker/") || strings.Contains(lower, "docker-") ||
-			strings.Contains(lower, "libpod-") || strings.Contains(lower, "/libpod/") {
+		switch {
+		case strings.Contains(lower, "/kubepods") || strings.Contains(lower, "kubepods-") ||
+			strings.Contains(lower, "cri-containerd-") || strings.Contains(lower, "crio-"):
+			container = "containerd"
+		case strings.Contains(lower, "/docker/") || strings.Contains(lower, "docker-") ||
+			strings.Contains(lower, "libpod-") || strings.Contains(lower, "/libpod/"):
 			container = "docker"
 		}
 		segments := strings.Split(path, "/")
@@ -2436,16 +2408,12 @@ func deploymentSanitizeLabel(value string) string {
 	}, value)
 }
 
-// deploymentShouldSkipContainerProcess 容器内进程默认跳过，由 docker 数据源统一提供容器清单
+// deploymentShouldSkipContainerProcess 容器 cgroup 内进程默认全部跳过，
+// 避免 Docker/Kubernetes 容器数量多时产生高基数和运行时卡死。
 func deploymentShouldSkipContainerProcess() bool {
-	if !deploymentEnvBool("DEPLOYMENT_INVENTORY_SKIP_CONTAINER_PROCESSES", true) {
-		return false
-	}
-	if !deploymentEnvBool("DEPLOYMENT_INVENTORY_DOCKER", true) {
-		return false
-	}
-	_, err := exec.LookPath("docker")
-	return err == nil
+	// 容器清单/容器内进程可能带来高基数和运行时卡死风险，默认全部跳过。
+	// 如确需采集容器内进程，可设置 DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true。
+	return !deploymentEnvBool("DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES", false)
 }
 
 // deploymentCollectProcesses 并发扫描 /proc，构建进程级部署清单
@@ -2487,7 +2455,7 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 				if ctx.Err() != nil {
 					return
 				}
-				info, ok := deploymentReadProcess(procRoot, pid)
+				info, ok := deploymentReadProcess(procRoot, pid, skipContainer)
 				if !ok || info == nil {
 					continue
 				}

@@ -1,10 +1,11 @@
 # 主机部署清单采集器（deployment_inventory_collector）
 
-`deployment_inventory` 用于采集主机上**已安装/已部署的服务、中间件、容器与定时任务清单**，
+`deployment_inventory` 用于采集主机上**已安装/已部署的服务、中间件与定时任务清单**，
 并将结果以 Prometheus 指标暴露。采集字段包括服务名、服务路径、运行用户、启动方式、
 中间件类型、工作目录（cwd）、可执行文件（exe）、根目录（root）等。
 
 - **默认排除系统服务、内核线程、桌面组件和开发工具进程**
+- **默认不采集 Docker/Kubernetes 容器，容器 cgroup 内进程也默认跳过，避免高基数与卡死**
 - **全异步刷新，`/metrics` 只读内存快照，不阻塞 Prometheus 抓取**
 - **默认每 24 小时刷新一次，首次启动立即在后台加载**
 - **各数据源并发采集，进程扫描使用固定工作池，外部命令带超时**
@@ -20,12 +21,13 @@
 | `initd` | 扫描 `/etc/init.d`，通过 `/etc/rc*.d/S*` 判断是否启用 |
 | `upstart` | 解析 `/etc/init/*.conf` 与 `.override`，兼容 Ubuntu 14、RHEL 6 等 Upstart 系统 |
 | `supervisor` | 解析 `/etc/supervisor/supervisord.conf`、`/etc/supervisor/conf.d/*.conf`、`/etc/supervisord.conf`、`/etc/supervisord.d/*` 中的 program |
-| `docker` | 通过 `docker ps -a` 采集容器（含已停止容器；老版本 Docker 自动回退到普通输出解析） |
 | `process` | 并发扫描 `/proc/<pid>`，读取 `exe`、`cwd`、`root`、`cmdline`、`cgroup`、UID 等 |
 | `cron` | 解析 `/etc/crontab`、`/etc/cron.d/*`、用户 crontab、`/etc/cron.{hourly,daily,weekly,monthly}/*`、`/etc/anacrontab`、systemd timer |
 
 进程扫描会通过 cgroup 将进程关联到 systemd 单元，并与 systemd/supervisor/initd 条目合并去重。
-Docker 容器内进程默认不重复出现在进程清单中（由 `docker` 数据源统一提供）。
+**Docker / Kubernetes containerd 容器默认不采集**，容器 cgroup 内进程也默认跳过，
+以避免 Pod/容器数量过多导致高基数、命令卡死或 node_exporter 资源占用过高。
+如需采集容器内进程，可显式设置 `DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true`。
 
 ---
 
@@ -42,17 +44,17 @@ node_deployment_inventory_info{
 
 | 标签 | 含义 |
 |------|------|
-| `service_name` | 服务名（systemd 单元名去后缀、容器名、进程名或 jar 名） |
-| `service_path` | 服务路径（ExecStart、init 脚本、容器镜像等） |
+| `service_name` | 服务名（systemd 单元名去后缀、进程名或 jar 名） |
+| `service_path` | 服务路径（ExecStart、init/upstart 脚本、可执行文件等） |
 | `service_user` | 运行用户 |
-| `startup_type` | 启动方式：`systemd` / `initd` / `upstart` / `supervisor` / `docker` / `process` |
+| `startup_type` | 启动方式：`systemd` / `initd` / `upstart` / `supervisor` / `process` |
 | `middleware` | 中间件类型（`nginx`、`mysql`、`redis`、`kafka` 等），未识别为 `none` |
 | `cwd` | 进程工作目录；systemd 默认 `/`，无法获取时为 `unknown` |
-| `exe` | 可执行文件路径；容器为镜像名 |
-| `root` | 进程根目录（`/proc/<pid>/root`）；容器为 `unknown` |
+| `exe` | 可执行文件路径 |
+| `root` | 进程根目录（`/proc/<pid>/root`），无法获取时为 `unknown` |
 | `status` | `running` / `inactive` / `exited` / `created` / `paused` / `unknown` |
 | `enabled` | 是否开机启动：`true` / `false` / `static` / `unknown` |
-| `source` | 数据来源：`systemd` / `initd` / `upstart` / `supervisor` / `docker` / `process` |
+| `source` | 数据来源：`systemd` / `initd` / `upstart` / `supervisor` / `process` |
 
 ### 2.2 定时任务清单
 
@@ -101,13 +103,13 @@ node_deployment_inventory_cron_info{
 | `DEPLOYMENT_INVENTORY_INITD` | `true` | 是否采集 init.d 服务 |
 | `DEPLOYMENT_INVENTORY_UPSTART` | `true` | 是否采集 Upstart 服务（Ubuntu 14 / RHEL 6） |
 | `DEPLOYMENT_INVENTORY_SUPERVISOR` | `true` | 是否采集 supervisor 配置 |
-| `DEPLOYMENT_INVENTORY_DOCKER` | `true` | 是否采集 Docker 容器 |
 | `DEPLOYMENT_INVENTORY_PROCESS` | `true` | 是否扫描 `/proc` 进程 |
 | `DEPLOYMENT_INVENTORY_CRON` | `true` | 是否采集定时任务 |
 | `DEPLOYMENT_INVENTORY_CRON_SCOPE` | `all` | 定时任务范围：`all` / `system` / `user` |
 | `DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES` | `true` | 是否采集用户会话中的进程；设为 `false` 只保留系统级部署 |
 | `DEPLOYMENT_INVENTORY_INCLUDE_DISABLED_INITD` | `false` | 是否包含未启用的 init.d 脚本 |
-| `DEPLOYMENT_INVENTORY_SKIP_CONTAINER_PROCESSES` | `true` | 是否跳过 Docker cgroup 内进程（避免与容器清单重复） |
+| `DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES` | `false` | 是否采集容器 cgroup 内进程（默认关闭，避免容器/Pod 高基数与卡死） |
+| `DEPLOYMENT_INVENTORY_PROC_LINKS` | `auto` | `/proc/<pid>/{exe,cwd,root}` 读取策略：`auto`（检测到 NFS/Ceph 等网络文件系统时跳过）/`all`/`none` |
 | `DEPLOYMENT_INVENTORY_EXCLUDE` | 空 | 额外排除项，逗号分隔，按名称子串匹配 |
 | `DEPLOYMENT_INVENTORY_INCLUDE` | 空 | 强制包含项（优先级高于系统服务排除），逗号分隔 |
 | `DEPLOYMENT_INVENTORY_CACHE_TTL` | `24h` | 数据源刷新失败时旧缓存最长保留时间，超过后丢弃该数据源旧数据 |
@@ -135,9 +137,39 @@ node_deployment_inventory_cron_info{
 1. 使用 CI 的 **legacy 二进制**（Go 1.23 编译，支持 kernel 2.6.32–3.10）；
 2. SysV init 脚本会解析 `DAEMON`/`PROG`/`USER`/`DAEMON_USER`/`chdir`，并与 `/proc` 进程按 exe 合并，兼容“服务名与进程名不一致”的场景；
 3. 无 systemd 时 `status` 主要来自进程合并，`systemd` 数据源为空但不会报错；
-4. 老版本 Docker 不支持 `--format` 时，会自动回退解析 `docker ps -a --no-trunc` 的普通输出；
-5. Upstart 的 `initctl` 位于 `/sbin` 或 `/usr/sbin`，采集器会按绝对路径查找；
-6. 老系统 cron 可能使用 Anacron，采集器会解析 `/etc/anacrontab` 中的自定义任务。
+4. Upstart 的 `initctl` 位于 `/sbin` 或 `/usr/sbin`，采集器会按绝对路径查找；
+5. 老系统 cron 可能使用 Anacron，采集器会解析 `/etc/anacrontab` 中的自定义任务。
+
+---
+
+## 3.2 容器与网络存储安全
+
+### 容器采集
+
+为避免 Docker / Kubernetes containerd 容器数量过多导致高基数、命令卡死或资源占用过高，
+采集器**默认不采集容器清单**，并默认跳过容器 cgroup 内的进程
+（`DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=false`）。
+
+如确需将容器内进程纳入部署清单，可显式设置：
+
+```sh
+export DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true
+```
+
+> 该开关只影响容器内进程，不会执行 `docker ps` / `crictl` 等容器运行时命令；
+> 大规模 Pod 环境建议保持关闭。
+
+### NFS / Ceph 挂死防护
+
+`/proc` 本身是本地虚拟文件系统，主要风险来自 `readlink /proc/<pid>/{exe,cwd,root}` 时进入业务 NFS/Ceph 路径。采集器提供：
+
+| `DEPLOYMENT_INVENTORY_PROC_LINKS` | 行为 |
+|-----------------------------------|------|
+| `auto`（默认） | 读取 `/proc/<pid>/mountinfo`，发现 `nfs`、`nfs4`、`ceph`、`cifs`、`glusterfs`、`fuse.*`、`lustre`、`9p`、`ocfs2` 等网络/集群文件系统时，跳过该进程的 `exe/cwd/root` readlink |
+| `all` | 保持原有行为，全部读取链接 |
+| `none` | 完全不读取链接，`exe` 仅从 `cmdline[0]` 提取，`cwd/root` 为 `unknown` |
+
+> 建议存在 NFS/Ceph 挂死风险的节点保持 `auto`；极端场景可设为 `none`，以损失部分 cwd/exe 信息换取最高安全性。
 
 ---
 
@@ -146,10 +178,10 @@ node_deployment_inventory_cron_info{
 1. **后台刷新**：`NewDeploymentInventoryCollector` 只启动一个后台协程，首次刷新异步执行；  
    `Collect()` 仅通过 `atomic.Pointer` 读取不可变快照，抓取延迟与主机进程数无关。
 2. **每日刷新**：默认 `ticker` 周期 24 小时，刷新完成后一次性替换快照。
-3. **并发采集**：systemd/initd/upstart/supervisor/docker/process/cron 数据源并发执行；
+3. **并发采集**：systemd/initd/upstart/supervisor/process/cron 数据源并发执行；
    systemd 单元与 `/proc` 进程均有固定大小工作池，避免 goroutine 数量失控。
 4. **超时控制**：整体刷新有 `context` 超时（默认 90s），并额外设置硬超时（+15s）；
-   `systemctl`、`supervisorctl`、`docker`、`initctl` 等外部命令另有 5–15 秒超时，
+   `systemctl`、`supervisorctl`、`initctl` 等外部命令另有 5–15 秒超时，
    且设置 `WaitDelay=2s`，即使孙进程继承管道也不会无限等待。
 5. **卡死跳过**：每个数据源有独立的执行中标记；若上一轮数据源卡住未返回，
    下一轮刷新直接跳过该数据源并沿用缓存，不会持续堆积 goroutine，也不会阻塞 `/metrics`。
@@ -234,7 +266,10 @@ node_deployment_inventory_cron_jobs_total
   - 确认目标服务未被系统服务/桌面组件过滤规则命中，可通过 `DEPLOYMENT_INVENTORY_INCLUDE` 强制包含。
 - **看不到 `nohup` 启动的进程？**
   - 默认包含用户会话进程；若设置了 `DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES=false`，请改回 `true`。
-- **容器部署时看到的是容器内清单？**
+- **会采集 Docker / Kubernetes containerd 容器吗？**
+  - 默认不采集。容器数量多时容易造成高基数和运行时卡死，采集器默认跳过容器 cgroup 内进程。
+    如确需容器内进程，可设置 `DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true`。
+- **node_exporter 运行在容器里，如何采集宿主机？**
   - 需挂载宿主机 `/proc` 并设置 `DEPLOYMENT_INVENTORY_PROC`、`DEPLOYMENT_INVENTORY_HOST_ROOT`。
 - **清单更新不及时？**
   - 默认 24 小时刷新一次，可通过 `DEPLOYMENT_INVENTORY_INTERVAL` 调整；修改后需重启 node_exporter。
