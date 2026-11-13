@@ -308,8 +308,8 @@ jobs:
           done
           # runner 为 amd64，可直接执行校验自定义采集器已注册
           ./.build/linux-amd64-legacy/node_exporter-linux-amd64-legacy --help 2>&1 \
-            | grep -oE 'collector\.(hardware_info|login_failed|network_interface|simple_port_process)\b' \
-            | sort -u | tee /dev/stderr | wc -l | grep -qx 4 \
+            | grep -oE 'collector\.(hardware_info|login_failed|network_interface|simple_port_process|deployment_inventory)\b' \
+            | sort -u | tee /dev/stderr | wc -l | grep -qx 5 \
             || { echo "::error::自定义采集器未全部注册"; exit 1; }
 
       - name: 上传构建产物

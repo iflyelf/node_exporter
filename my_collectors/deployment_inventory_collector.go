@@ -1,0 +1,2507 @@
+// Package my_collectors 提供 Prometheus 指标收集器
+//
+// 本文件实现「主机部署清单采集器」（deployment_inventory）。
+//
+// 设计目标：
+//  1. 采集主机上已安装/已部署的服务、中间件、容器、定时任务清单；
+//  2. 采集字段包含：服务名、服务路径、运行用户、启动方式、中间件类型、
+//     工作目录(cwd)、可执行文件(exe)、根目录(root) 等；
+//  3. 默认排除操作系统自带服务与内核线程，只保留业务部署与中间件；
+//  4. 全异步刷新：Collect() 只读取内存快照，绝不阻塞 /metrics；
+//  5. 默认每 24 小时刷新一次，首次启动立即在后台刷新；
+//  6. 所有外部命令带超时，进程扫描使用固定大小工作池，避免高并发/死锁；
+//  7. 任一数据源刷新失败时保留该数据源上一次成功结果，避免指标突然消失。
+package my_collectors
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	// deploymentDefaultInterval 默认刷新周期（一天一次）
+	deploymentDefaultInterval = 24 * time.Hour
+	// deploymentDefaultTimeout 单次刷新总超时
+	deploymentDefaultTimeout = 90 * time.Second
+	// deploymentHardExtraTimeout 超时后额外等待时间，避免个别数据源卡死刷新协程
+	deploymentHardExtraTimeout = 15 * time.Second
+	// deploymentMaxServices 单次最大服务条目数，防止异常环境导致指标基数爆炸
+	deploymentMaxServices = 3000
+	// deploymentMaxCronJobs 单次最大定时任务条目数
+	deploymentMaxCronJobs = 1000
+	// deploymentMaxProcesses 最大扫描进程数
+	deploymentMaxProcesses = 10000
+	// deploymentMaxUnitFiles 最大解析 systemd 单元文件数
+	deploymentMaxUnitFiles = 5000
+	// deploymentMaxCronFiles 最大解析 cron 文件数
+	deploymentMaxCronFiles = 2000
+	// deploymentMaxFileSize 单个配置文件最大读取字节数（1 MiB）
+	deploymentMaxFileSize = 1 << 20
+)
+
+// deploymentInventoryService 单条服务/中间件部署信息
+type deploymentInventoryService struct {
+	Name        string // 服务名（systemd 单元名去掉 .service、容器名、进程名等）
+	Path        string // 服务路径（ExecStart、init 脚本、容器镜像等）
+	User        string // 运行用户
+	StartupType string // 启动方式：systemd/initd/supervisor/docker/process
+	Middleware  string // 中间件类型，未识别为 none
+	Cwd         string // 进程工作目录
+	Exe         string // 可执行文件路径
+	Root        string // 进程根目录
+	Status      string // 运行状态：running/inactive/exited/unknown
+	Enabled     string // 是否开机启动：true/false/static/unknown
+	Source      string // 数据来源：systemd/initd/supervisor/docker/process
+
+	dedupKey  string // 内部去重键，不对外暴露
+	instances int    // 进程实例数，内部合并使用
+}
+
+// deploymentInventoryCron 单条定时任务信息
+type deploymentInventoryCron struct {
+	Name     string // 任务名（文件名:行号 / systemd timer 名）
+	User     string // 执行用户
+	Schedule string // 调度表达式
+	Command  string // 执行命令
+	Cwd      string // 工作目录（从命令中的 cd 解析，未知为 unknown）
+	Path     string // 配置文件路径
+	Scope    string // system/user
+	Source   string // crontab/cron.d/spool/cron.daily/systemd-timer
+}
+
+// deploymentInventorySnapshot 只读快照，发布后不再修改
+type deploymentInventorySnapshot struct {
+	services    []deploymentInventoryService
+	crons       []deploymentInventoryCron
+	lastRefresh time.Time
+	duration    time.Duration
+	sourceUp    map[string]float64
+}
+
+var (
+	// deploymentInventorySnapshotPtr 原子指针，Collect 无锁读取
+	deploymentInventorySnapshotPtr atomic.Pointer[deploymentInventorySnapshot]
+
+	// deploymentInventoryRefreshMu 保证同一时刻只有一个刷新任务在跑
+	deploymentInventoryRefreshMu sync.Mutex
+
+	// deploymentInventoryStartOnce 保证后台刷新协程只启动一次
+	deploymentInventoryStartOnce sync.Once
+
+	// deploymentInventoryRefreshErrors 累计刷新错误次数（按数据源失败次数计）
+	deploymentInventoryRefreshErrors atomic.Uint64
+
+	// deploymentInventoryHostUsers 缓存宿主机 /etc/passwd 解析结果
+	deploymentInventoryHostUsersOnce sync.Once
+	deploymentInventoryHostUsersMap  map[int]string
+
+	// deploymentInventoryUserCache 缓存 UID -> 用户名，避免重复 NSS 查询
+	deploymentInventoryUserCache sync.Map
+)
+
+// ==========================================================================
+// 环境变量解析
+// ==========================================================================
+
+func deploymentEnvDuration(name string, def time.Duration) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return def
+}
+
+func deploymentEnvInt(name string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func deploymentEnvBool(name string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
+}
+
+// deploymentInventoryConcurrency 返回进程/单元文件扫描并发度
+func deploymentInventoryConcurrency() int {
+	def := runtime.NumCPU() * 2
+	if def < 4 {
+		def = 4
+	}
+	if def > 16 {
+		def = 16
+	}
+	n := deploymentEnvInt("DEPLOYMENT_INVENTORY_CONCURRENCY", def)
+	if n > 64 {
+		n = 64
+	}
+	return n
+}
+
+// deploymentHostRoot 返回宿主机根目录（容器部署时用于读取宿主机配置）
+func deploymentHostRoot() string {
+	root := strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_HOST_ROOT"))
+	if root == "" || root == "/" {
+		return ""
+	}
+	return filepath.Clean(root)
+}
+
+// deploymentHostPath 将宿主机绝对路径映射到容器内可见路径
+func deploymentHostPath(p string) string {
+	root := deploymentHostRoot()
+	if root == "" {
+		return p
+	}
+	return filepath.Join(root, strings.TrimPrefix(p, "/"))
+}
+
+// deploymentProcRoot 返回 /proc 路径前缀，兼容容器挂载 /host/proc
+func deploymentProcRoot() string {
+	if v := strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_PROC")); v != "" {
+		return filepath.Clean(v)
+	}
+	if v := strings.TrimSpace(os.Getenv("PROC_PREFIX")); v != "" {
+		return filepath.Clean(v)
+	}
+	return "/proc"
+}
+
+// ==========================================================================
+// 系统服务/内核线程/交互式进程过滤
+// ==========================================================================
+
+// deploymentSystemNames 系统服务或系统守护进程黑名单
+// 说明：这里只排除操作系统基础服务，nginx/mysql/redis 等业务中间件不在其中。
+var deploymentSystemNames = map[string]struct{}{
+	"systemd": {}, "init": {}, "systemd-journald": {}, "systemd-logind": {},
+	"systemd-networkd": {}, "systemd-resolved": {}, "systemd-timesyncd": {},
+	"systemd-udevd": {}, "systemd-user-sessions": {}, "systemd-coredump": {},
+	"dbus": {}, "dbus-daemon": {}, "dbus-broker": {}, "polkit": {}, "polkitd": {},
+	"accounts-daemon": {}, "udisks2": {}, "upower": {}, "avahi-daemon": {},
+	"modemmanager": {}, "networkmanager": {}, "wpa-supplicant": {},
+	"bluetooth": {}, "cups": {}, "cups-browsed": {},
+	"ssh": {}, "sshd": {}, "login": {}, "agetty": {}, "getty": {},
+	"cron": {}, "crond": {}, "atd": {}, "anacron": {},
+	"rsyslog": {}, "rsyslogd": {}, "syslog-ng": {}, "systemd-journald-audit": {},
+	"auditd": {}, "kdump": {}, "kexec": {}, "firewalld": {}, "iptables": {},
+	"ip6tables": {}, "nftables": {}, "ufw": {}, "fail2ban": {},
+	"chronyd": {}, "chrony": {}, "ntpd": {}, "ntp": {}, "irqbalance": {},
+	"smartd": {}, "lvm2-lvmpolld": {}, "multipathd": {}, "iscsid": {},
+	"iscsi": {}, "nfs-server": {}, "nfs-client": {}, "rpcbind": {},
+	"rpc-statd": {}, "rpc-gssd": {}, "rpc-svcgssd": {}, "rpcbind.service": {},
+	"sssd": {}, "winbind": {}, "nscd": {}, "oddjobd": {},
+	"packagekit": {}, "packagekit-offline-update": {}, "snapd": {},
+	"unattended-upgrades": {}, "apt-daily": {}, "apt-daily-upgrade": {},
+	"apt-news": {}, "dpkg-db-backup": {}, "man-db": {}, "logrotate": {},
+	"e2scrub-all": {}, "e2scrub-reap": {}, "fstrim": {},
+	"gdm": {}, "lightdm": {}, "sddm": {}, "display-manager": {},
+	"xorg": {}, "xwayland": {}, "pulseaudio": {}, "pipewire": {},
+	"containerd-shim": {}, "docker-proxy": {},
+	"vgauth": {}, "vmtoolsd": {}, "open-vm-tools": {}, "qemu-guest-agent": {},
+	"waagent": {}, "cloud-init": {}, "e2scrub_all": {}, "e2scrub_reap": {},
+	"locate": {}, "plocate": {}, "mlocate": {}, "coredump-reporter": {},
+	"wpa_supplicant": {}, "mpris-proxy": {}, "gcr-ssh-agent": {},
+	"README": {}, "rc": {}, "rcS": {}, "gdomap": {}, "ipsec": {},
+	"smartmontools": {}, "blk-availability": {}, "rbdmap": {}, "ldconfig": {},
+	"live-config": {}, "replace-lightdm": {}, "grub-common": {},
+	"networkmanager-wait-online": {}, "getty-static": {}, "kmod-static-nodes": {},
+	"user": {}, "user-runtime-dir": {}, "serial-getty": {},
+	"acpid": {}, "paxctld": {}, "procps": {}, "seatd": {}, "sudo": {},
+	"tlp": {}, "rsync": {}, "network": {}, "networking": {},
+	"mountkernfs": {}, "mountdevsubfs": {}, "checkroot": {}, "checkfs": {},
+	"umountroot": {}, "umountfs": {}, "sendsigs": {}, "bootlogs": {},
+	"hwclock": {}, "hostname": {}, "killprocs": {}, "single": {},
+	"halt": {}, "reboot": {},
+}
+
+// deploymentSystemExecBasenames 系统工具类可执行文件，非自定义部署不作为服务展示
+var deploymentSystemExecBasenames = map[string]struct{}{
+	"mount": {}, "umount": {}, "true": {}, "false": {},
+	"ldconfig": {}, "kmod": {}, "modprobe": {}, "insmod": {}, "rmmod": {}, "depmod": {},
+	"alsactl": {}, "plymouth": {}, "plymouthd": {}, "grub-editenv": {},
+	"nm-online": {}, "rbdmap": {}, "systemctl": {}, "live-config": {},
+	"swapon": {}, "swapoff": {}, "fsck": {}, "e2fsck": {}, "mkswap": {},
+	"hwclock": {}, "setterm": {}, "loadkeys": {}, "console-setup": {},
+	"keyboard-setup": {}, "udevadm": {}, "sysctl": {}, "update-rc.d": {},
+	"chkconfig": {}, "service": {}, "init": {}, "shutdown": {}, "reboot": {},
+	"poweroff": {}, "telinit": {}, "runlevel": {}, "hostname": {},
+	"hostnamectl": {}, "localectl": {}, "timedatectl": {}, "loginctl": {},
+	"resolvectl": {}, "networkctl": {}, "busctl": {},
+	"systemd-tmpfiles": {}, "systemd-sysusers": {}, "systemd-sysctl": {},
+	"systemd-random-seed": {}, "systemd-binfmt": {}, "systemd-modules-load": {},
+	"systemd-fsck": {}, "systemd-quotacheck": {}, "systemd-remount-fs": {},
+	"systemd-update-utmp": {}, "systemd-machine-id-setup": {}, "systemd-firstboot": {},
+	"systemd-hwdb": {}, "systemd-backlight": {}, "systemd-cryptsetup": {},
+	"systemd-cryptenroll": {}, "systemd-boot": {}, "systemd-pstore": {},
+	"systemd-repart": {}, "systemd-sleep": {}, "systemd-hibernate": {},
+	"systemd-suspend": {}, "systemd-udev-settle": {}, "systemd-udev-trigger": {},
+	"systemd-journal-flush": {}, "systemd-journal-catalog-update": {},
+	"systemd-tmpfiles-clean": {}, "systemd-tmpfiles-setup": {},
+	"systemd-update-utmp-runlevel": {}, "systemd-user-sessions": {},
+}
+
+// deploymentSystemPrefixes 系统服务/内核线程/桌面会话名称前缀
+var deploymentSystemPrefixes = []string{
+	"systemd-", "user@", "getty@", "serial-getty@", "console-getty",
+	"kworker", "ksoftirqd", "migration", "rcu", "watchdog", "cpuhp",
+	"idle_inject", "irq/", "jbd2", "kdmflush", "kmpath", "scsi_",
+	"xfs-", "xfs_", "ext4-", "kauditd", "oom_reaper", "kdevtmpfs", "netns",
+	"khungtaskd", "writeback", "kintegrityd", "kblockd", "ata_",
+	"edac", "devfreq", "zswap", "zram", "kthrotld", "ipv6_addrconf",
+	"kstrp", "psimon", "tls-strp", "kcompactd", "khugepaged", "ksmd",
+	"kswapd", "numa", "dbus-", "avahi-", "gnome-", "org.deepin", "org.gnome",
+	"org.freedesktop", "dde-", "deepin-", "lastore", "linglong", "uos-",
+	"trayplugin", "dconf", "gvfs", "xdg-", "ibus-", "fcitx", "at-spi",
+	"kde", "plasma", "xfce", "mate-", "cinnamon", "kwin", "gjs",
+	"evolution", "tracker", "goa-", "mission-center", "switcheroo",
+	"bolt", "colord", "geoclue", "rtkit", "power-profiles-daemon",
+	"thermald", "bluetoothd", "cupsd", "e2scrub", "coredump-",
+	"apt-", "dpkg", "packagekit", "unattended-upgr",
+	"sshd", "ssh-", "vmware", "vmblock", "vmhgfs", "vmmemctl",
+	"mpris", "obex", "wireplumber", "pipewire-", "gcr-ssh",
+	"plymouth", "lvm2", "alsa", "tpm2", "grub", "kmod", "networkmanager",
+	"getty", "mnt-", "media-", "mdadm", "dmraid", "fcoe", "fwupd", "apport",
+	"whoopsie", "kerneloops", "pollinate", "apparmor", "selinux",
+	"cryptdisks", "paxctl", "procps", "pulseaudio", "seatd", "tlp",
+	"x11", "acpi", "console-setup", "keyboard-setup", "replace-lightdm",
+}
+
+// deploymentInteractiveNames 交互式/短生命周期命令黑名单，避免把用户登录态进程当成服务
+var deploymentInteractiveNames = map[string]struct{}{
+	"bash": {}, "sh": {}, "dash": {}, "zsh": {}, "fish": {}, "ksh": {},
+	"csh": {}, "tcsh": {}, "vim": {}, "vi": {}, "nvim": {}, "nano": {},
+	"emacs": {}, "less": {}, "more": {}, "tail": {}, "head": {}, "cat": {},
+	"grep": {}, "egrep": {}, "fgrep": {}, "sed": {}, "awk": {}, "find": {},
+	"locate": {}, "ps": {}, "top": {}, "htop": {}, "atop": {}, "iotop": {},
+	"lsof": {}, "ss": {}, "netstat": {}, "ping": {}, "curl": {}, "wget": {},
+	"git": {}, "scp": {}, "sftp": {}, "rsync": {}, "ssh": {}, "sudo": {},
+	"su": {}, "tmux": {}, "screen": {}, "journalctl": {}, "dmesg": {},
+	"apt": {}, "apt-get": {}, "dpkg": {}, "yum": {}, "dnf": {}, "rpm": {},
+	"systemctl": {}, "service": {}, "chkconfig": {}, "update-rc.d": {},
+	"python -c": {}, "python3 -c": {}, "perl -e": {}, "ruby -e": {},
+	"sleep": {}, "wait": {}, "timeout": {}, "watch": {}, "nohup": {},
+	"env": {}, "xargs": {}, "tee": {}, "yes": {}, "seq": {}, "test": {},
+	"[": {}, "true": {}, "false": {}, "date": {}, "uname": {}, "whoami": {},
+	"id": {}, "pwd": {}, "echo": {}, "printf": {}, "mkdir": {}, "rm": {},
+	"cp": {}, "mv": {}, "ln": {}, "chmod": {}, "chown": {}, "tar": {},
+	"gzip": {}, "gunzip": {}, "zip": {}, "unzip": {}, "dd": {}, "df": {},
+	"du": {}, "free": {}, "uptime": {}, "w": {}, "who": {}, "last": {},
+	"lastb": {}, "lscpu": {}, "lsblk": {}, "lspci": {}, "lsusb": {},
+}
+
+// deploymentExtraExcludes 解析 DEPLOYMENT_INVENTORY_EXCLUDE（逗号分隔，子串匹配）
+func deploymentExtraExcludes() []string {
+	raw := strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_EXCLUDE"))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// deploymentExtraIncludes 解析 DEPLOYMENT_INVENTORY_INCLUDE（逗号分隔，子串匹配，优先级高于排除规则）
+func deploymentExtraIncludes() []string {
+	raw := strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_INCLUDE"))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func deploymentNormalizeServiceName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.TrimSuffix(name, ".service")
+	name = strings.TrimSuffix(name, ".timer")
+	name = strings.TrimSuffix(name, ".socket")
+	if idx := strings.Index(name, "@"); idx >= 0 {
+		name = name[:idx]
+	}
+	return name
+}
+
+// deploymentIsSystemService 判断是否系统服务（默认排除）
+func deploymentIsSystemService(name string) bool {
+	base := deploymentNormalizeServiceName(name)
+	if base == "" {
+		return true
+	}
+	for _, p := range deploymentExtraIncludes() {
+		if strings.Contains(base, p) {
+			return false
+		}
+	}
+	if _, ok := deploymentSystemNames[base]; ok {
+		return true
+	}
+	for _, p := range deploymentSystemPrefixes {
+		if strings.HasPrefix(base, p) {
+			return true
+		}
+	}
+	for _, p := range deploymentExtraExcludes() {
+		if strings.Contains(base, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// deploymentIsInteractiveProcess 判断是否交互式/短生命周期进程
+func deploymentIsInteractiveProcess(name string) bool {
+	base := deploymentNormalizeServiceName(name)
+	if _, ok := deploymentInteractiveNames[base]; ok {
+		return true
+	}
+	for _, p := range deploymentExtraExcludes() {
+		if strings.Contains(base, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// deploymentIsToolingProcess 判断是否开发工具/编辑器/桌面辅助进程（默认不纳入部署清单）
+func deploymentIsToolingProcess(name, exe, cmdline string) bool {
+	lowerName := strings.ToLower(name)
+	toolPrefixes := []string{
+		"code-server", "code-", "vscode", "opencode", "copilot", "codex",
+		"ptyserver", "ptyhost", "extensionhost", "tsserver", "gopls",
+		"rust-analyzer", "clangd", "pyright", "jedi-language", "gcr-ssh",
+		"mpris", "ssh-agent", "wireplumber", "obex", "dconf", "gvfs",
+	}
+	for _, p := range toolPrefixes {
+		if strings.HasPrefix(lowerName, p) {
+			return true
+		}
+	}
+	for _, text := range []string{exe, cmdline} {
+		lower := strings.ToLower(text)
+		for _, marker := range []string{
+			"/.vscode-server/", "/.vscode/", "/.cursor-server/", "/.cursor/",
+			"/.opencode/", "/.codex/", "/.cache/", "/.npm/", "/.nvm/",
+			"/.config/nvm/", "/.local/lib/", "/node_modules/", "/.local/share/",
+		} {
+			if strings.Contains(lower, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// deploymentIsSystemPath 判断可执行文件是否属于系统服务目录
+func deploymentIsSystemPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	for _, p := range []string{"/usr/lib/systemd/", "/lib/systemd/", "/usr/libexec/systemd/"} {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// deploymentIsSystemExec 判断可执行文件是否系统工具（不作为业务服务展示）
+func deploymentIsSystemExec(path string) bool {
+	if path == "" || path == "unknown" {
+		return false
+	}
+	_, ok := deploymentSystemExecBasenames[strings.ToLower(filepath.Base(path))]
+	return ok
+}
+
+// ==========================================================================
+// 中间件识别
+// ==========================================================================
+
+// deploymentMiddlewareAliases 中间件别名映射（key 为小写 token，value 为展示名）
+var deploymentMiddlewareAliases = map[string]string{
+	"nginx": "nginx", "openresty": "nginx", "tengine": "nginx",
+	"httpd": "apache", "apache2": "apache", "apache": "apache",
+	"mysqld": "mysql", "mysql": "mysql", "mariadbd": "mariadb", "mariadb": "mariadb",
+	"postgres": "postgresql", "postmaster": "postgresql", "postgresql": "postgresql",
+	"redis": "redis", "redis-server": "redis",
+	"mongod": "mongodb", "mongodb": "mongodb",
+	"elasticsearch": "elasticsearch", "opensearch": "opensearch",
+	"rabbitmq": "rabbitmq", "rabbitmq-server": "rabbitmq",
+	"kafka": "kafka", "zookeeper": "zookeeper", "rocketmq": "rocketmq",
+	"activemq": "activemq", "pulsar": "pulsar", "emqx": "emqx", "mosquitto": "mosquitto",
+	"tomcat": "tomcat", "catalina": "tomcat", "jetty": "jetty",
+	"wildfly": "wildfly", "jboss": "jboss",
+	"docker": "docker", "dockerd": "docker", "containerd": "containerd", "podman": "podman",
+	"kubelet": "kubernetes", "kube-apiserver": "kubernetes", "kube-proxy": "kubernetes",
+	"etcd": "etcd", "consul": "consul", "nacos": "nacos",
+	"memcached": "memcached", "clickhouse": "clickhouse", "clickhouse-server": "clickhouse",
+	"influxd": "influxdb", "influxdb": "influxdb",
+	"prometheus": "prometheus", "grafana": "grafana", "grafana-server": "grafana",
+	"filebeat": "filebeat", "logstash": "logstash", "kibana": "kibana",
+	"haproxy": "haproxy", "keepalived": "keepalived", "traefik": "traefik", "caddy": "caddy",
+	"minio": "minio", "jenkins": "jenkins", "nexus": "nexus", "gitlab": "gitlab",
+	"harbor": "harbor", "sonarqube": "sonarqube", "zabbix": "zabbix",
+	"gunicorn": "gunicorn", "uwsgi": "uwsgi",
+	"oracle": "oracle", "tnslsnr": "oracle", "sqlservr": "sqlserver",
+	"cassandra": "cassandra", "hbase": "hbase", "hive": "hive",
+	"hadoop": "hadoop", "spark": "spark", "sentinel": "sentinel", "seata": "seata",
+}
+
+// deploymentDetectMiddleware 从名称、路径、命令行、镜像名中识别中间件
+func deploymentDetectMiddleware(name, path, cmdline, image string) string {
+	texts := []string{name, path, cmdline, image}
+	for _, text := range texts {
+		lower := strings.ToLower(text)
+		if lower == "" {
+			continue
+		}
+		// 先整体精确匹配（如 mysqld、redis-server）
+		normalized := deploymentNormalizeServiceName(filepath.Base(lower))
+		if m, ok := deploymentMiddlewareAliases[normalized]; ok {
+			return m
+		}
+		// 再按 token 匹配（如 nginx:1.25、kafka_2.13-3.6.0.jar）
+		tokens := strings.FieldsFunc(lower, func(r rune) bool {
+			return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
+		})
+		for _, token := range tokens {
+			if m, ok := deploymentMiddlewareAliases[token]; ok {
+				return m
+			}
+		}
+	}
+	return "none"
+}
+
+// ==========================================================================
+// 通用文件读取与用户解析
+// ==========================================================================
+
+func deploymentReadFileLimited(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, limit))
+}
+
+func deploymentCleanProcPath(p string) string {
+	p = strings.TrimSuffix(strings.TrimSpace(p), " (deleted)")
+	if p == "" {
+		return "unknown"
+	}
+	return p
+}
+
+// deploymentLoadHostUsers 解析宿主机 /etc/passwd，兼容容器内 UID 与宿主机不一致的场景
+func deploymentLoadHostUsers() map[int]string {
+	deploymentInventoryHostUsersOnce.Do(func() {
+		deploymentInventoryHostUsersMap = make(map[int]string)
+		data, err := deploymentReadFileLimited(deploymentHostPath("/etc/passwd"), deploymentMaxFileSize)
+		if err != nil {
+			return
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Split(line, ":")
+			if len(fields) < 3 {
+				continue
+			}
+			uid, err := strconv.Atoi(fields[2])
+			if err != nil {
+				continue
+			}
+			deploymentInventoryHostUsersMap[uid] = fields[0]
+		}
+	})
+	return deploymentInventoryHostUsersMap
+}
+
+func deploymentUserName(uid int) string {
+	if uid < 0 {
+		return "unknown"
+	}
+	if cached, ok := deploymentInventoryUserCache.Load(uid); ok {
+		return cached.(string)
+	}
+	name := ""
+	if n, ok := deploymentLoadHostUsers()[uid]; ok && n != "" {
+		name = n
+	}
+	if name == "" {
+		if u, err := user.LookupId(strconv.Itoa(uid)); err == nil && u.Username != "" {
+			name = u.Username
+		}
+	}
+	if name == "" {
+		name = strconv.Itoa(uid)
+	}
+	deploymentInventoryUserCache.Store(uid, name)
+	return name
+}
+
+// ==========================================================================
+// 后台刷新调度
+// ==========================================================================
+
+func deploymentInventorySafeRefresh(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[deployment_inventory] refresh panic recovered: %v", r)
+		}
+	}()
+	deploymentInventoryRefreshOnce(ctx)
+}
+
+// startDeploymentInventoryWorker 启动后台刷新协程（幂等）
+func startDeploymentInventoryWorker() {
+	deploymentInventoryStartOnce.Do(func() {
+		go func() {
+			// 首次刷新异步执行，不阻塞 node_exporter 启动与 /metrics 暴露
+			deploymentInventorySafeRefresh(context.Background())
+
+			interval := deploymentEnvDuration("DEPLOYMENT_INVENTORY_INTERVAL", deploymentDefaultInterval)
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for range ticker.C {
+				deploymentInventorySafeRefresh(context.Background())
+			}
+		}()
+	})
+}
+
+type deploymentInventorySourceResult struct {
+	name     string
+	services []deploymentInventoryService
+	crons    []deploymentInventoryCron
+	err      error
+}
+
+type deploymentInventorySource struct {
+	name    string
+	collect func(context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error)
+}
+
+// deploymentInventorySources 返回本次启用的数据源
+func deploymentInventorySources() []deploymentInventorySource {
+	sources := make([]deploymentInventorySource, 0, 6)
+	if deploymentEnvBool("DEPLOYMENT_INVENTORY_SYSTEMD", true) {
+		sources = append(sources, deploymentInventorySource{name: "systemd", collect: deploymentCollectSystemd})
+	}
+	if deploymentEnvBool("DEPLOYMENT_INVENTORY_INITD", true) {
+		sources = append(sources, deploymentInventorySource{name: "initd", collect: deploymentCollectInitd})
+	}
+	if deploymentEnvBool("DEPLOYMENT_INVENTORY_SUPERVISOR", true) {
+		sources = append(sources, deploymentInventorySource{name: "supervisor", collect: deploymentCollectSupervisor})
+	}
+	if deploymentEnvBool("DEPLOYMENT_INVENTORY_DOCKER", true) {
+		sources = append(sources, deploymentInventorySource{name: "docker", collect: deploymentCollectDocker})
+	}
+	if deploymentEnvBool("DEPLOYMENT_INVENTORY_PROCESS", true) {
+		sources = append(sources, deploymentInventorySource{name: "process", collect: deploymentCollectProcesses})
+	}
+	if deploymentEnvBool("DEPLOYMENT_INVENTORY_CRON", true) {
+		sources = append(sources, deploymentInventorySource{name: "cron", collect: deploymentCollectCron})
+	}
+	return sources
+}
+
+// deploymentInventoryRefreshOnce 执行一次完整刷新并原子发布快照
+func deploymentInventoryRefreshOnce(parent context.Context) {
+	// TryLock 防止上一轮刷新尚未结束时重复进入；不阻塞调用方
+	if !deploymentInventoryRefreshMu.TryLock() {
+		return
+	}
+	defer deploymentInventoryRefreshMu.Unlock()
+
+	start := time.Now()
+	timeout := deploymentEnvDuration("DEPLOYMENT_INVENTORY_TIMEOUT", deploymentDefaultTimeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	sources := deploymentInventorySources()
+	prev := deploymentInventorySnapshotPtr.Load()
+
+	results := make(map[string]deploymentInventorySourceResult, len(sources))
+	resultCh := make(chan deploymentInventorySourceResult, len(sources))
+
+	var wg sync.WaitGroup
+	for _, src := range sources {
+		wg.Add(1)
+		go func(s deploymentInventorySource) {
+			defer wg.Done()
+			res := deploymentInventorySourceResult{name: s.name}
+			// 无论是否 panic 都必须回传结果，避免刷新流程等待不到该数据源
+			defer func() {
+				if r := recover(); r != nil {
+					res.services, res.crons, res.err = nil, nil, fmt.Errorf("panic: %v", r)
+				}
+				resultCh <- res
+			}()
+			res.services, res.crons, res.err = s.collect(ctx)
+		}(src)
+	}
+
+	// 所有数据源并发执行；全部结束后关闭 channel
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	hardTimer := time.NewTimer(timeout + deploymentHardExtraTimeout)
+	defer hardTimer.Stop()
+
+collectLoop:
+	for {
+		select {
+		case res, ok := <-resultCh:
+			if !ok {
+				break collectLoop
+			}
+			results[res.name] = res
+		case <-hardTimer.C:
+			// 极端情况下（第三方命令不响应）不再等待，使用已有结果
+			log.Printf("[deployment_inventory] refresh hard timeout after %s, use partial results", timeout+deploymentHardExtraTimeout)
+			break collectLoop
+		}
+	}
+
+	// 失败数据源保留上一次成功结果，避免指标抖动或清空
+	prevBySource := make(map[string][]deploymentInventoryService)
+	prevCronBySource := make(map[string][]deploymentInventoryCron)
+	if prev != nil {
+		for _, svc := range prev.services {
+			prevBySource[svc.Source] = append(prevBySource[svc.Source], svc)
+		}
+		for _, cj := range prev.crons {
+			prevCronBySource[cj.Source] = append(prevCronBySource[cj.Source], cj)
+		}
+	}
+
+	sourceUp := make(map[string]float64, len(sources))
+	var services []deploymentInventoryService
+	var crons []deploymentInventoryCron
+	var errCount uint64
+	var errMsgs []string
+
+	for _, src := range sources {
+		res, ok := results[src.name]
+		if !ok || res.err != nil {
+			sourceUp[src.name] = 0
+			errCount++
+			if res.err != nil {
+				errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", src.name, res.err))
+			}
+			services = append(services, prevBySource[src.name]...)
+			if src.name == "cron" {
+				// cron 条目的 Source 细分为 crontab/cron.d/systemd-timer 等，
+				// 失败回退时统一使用上一轮全部 cron 缓存。
+				if prev != nil {
+					crons = append(crons, prev.crons...)
+				}
+			} else {
+				crons = append(crons, prevCronBySource[src.name]...)
+			}
+			continue
+		}
+		sourceUp[src.name] = 1
+		services = append(services, res.services...)
+		crons = append(crons, res.crons...)
+	}
+
+	services = deploymentMergeServices(services)
+	crons = deploymentMergeCrons(crons)
+
+	snapshot := &deploymentInventorySnapshot{
+		services:    services,
+		crons:       crons,
+		lastRefresh: time.Now(),
+		duration:    time.Since(start),
+		sourceUp:    sourceUp,
+	}
+	deploymentInventorySnapshotPtr.Store(snapshot)
+
+	if errCount > 0 {
+		deploymentInventoryRefreshErrors.Add(errCount)
+		log.Printf("[deployment_inventory] refresh completed with %d error(s): %s", errCount, strings.Join(errMsgs, "; "))
+	}
+	log.Printf("[deployment_inventory] refresh completed: services=%d cron_jobs=%d duration=%s",
+		len(snapshot.services), len(snapshot.crons), snapshot.duration.Round(time.Millisecond))
+}
+
+// deploymentMergeServices 合并来自不同数据源的重复服务，并限制最大条目数
+func deploymentMergeServices(input []deploymentInventoryService) []deploymentInventoryService {
+	if len(input) == 0 {
+		return nil
+	}
+
+	merged := make(map[string]*deploymentInventoryService, len(input))
+	nameIndex := make(map[string][]string) // 服务名 -> 配置类服务去重键
+
+	mergeInto := func(dst, src *deploymentInventoryService) {
+		if src.Path != "" && dst.Path == "" {
+			dst.Path = src.Path
+		}
+		if src.Exe != "" && src.Exe != "unknown" {
+			dst.Exe = src.Exe
+		} else if dst.Exe == "" {
+			dst.Exe = "unknown"
+		}
+		if src.Cwd != "" && src.Cwd != "unknown" {
+			dst.Cwd = src.Cwd
+		}
+		if src.Root != "" && src.Root != "unknown" {
+			dst.Root = src.Root
+		}
+		if src.User != "" && src.User != "unknown" {
+			dst.User = src.User
+		}
+		if src.Status == "running" {
+			dst.Status = "running"
+		} else if dst.Status == "" || dst.Status == "unknown" {
+			if src.Status != "" {
+				dst.Status = src.Status
+			}
+		}
+		if dst.Middleware == "none" && src.Middleware != "none" {
+			dst.Middleware = src.Middleware
+		}
+		if src.Enabled == "true" {
+			dst.Enabled = "true"
+		} else if dst.Enabled == "" || dst.Enabled == "unknown" {
+			if src.Enabled != "" {
+				dst.Enabled = src.Enabled
+			}
+		}
+		dst.instances += src.instances
+	}
+
+	// 第一轮：配置类数据源（systemd/initd/supervisor/docker）优先
+	for i := range input {
+		svc := input[i]
+		if svc.Source == "process" {
+			continue
+		}
+		key := svc.dedupKey
+		if key == "" {
+			key = svc.Source + ":" + deploymentNormalizeServiceName(svc.Name)
+		}
+		if existing, ok := merged[key]; ok {
+			mergeInto(existing, &svc)
+			continue
+		}
+		copySvc := svc
+		copySvc.dedupKey = key
+		merged[key] = &copySvc
+		nameKey := deploymentNormalizeServiceName(svc.Name)
+		nameIndex[nameKey] = append(nameIndex[nameKey], key)
+	}
+
+	// 第二轮：进程扫描结果，优先合并到同名的 systemd/initd/supervisor 条目
+	for i := range input {
+		svc := input[i]
+		if svc.Source != "process" {
+			continue
+		}
+
+		key := svc.dedupKey
+		if key == "" {
+			key = "process:" + deploymentNormalizeServiceName(svc.Name) + "|" + svc.Exe + "|" + svc.Cwd + "|" + svc.User
+		}
+
+		if existing, ok := merged[key]; ok {
+			mergeInto(existing, &svc)
+			continue
+		}
+
+		// 非 systemd 单元进程：尝试按名称合并到 initd / supervisor 配置
+		if strings.HasPrefix(key, "process:") {
+			nameKey := deploymentNormalizeServiceName(svc.Name)
+			if keys := nameIndex[nameKey]; len(keys) == 1 {
+				target := merged[keys[0]]
+				if target != nil && (target.Source == "initd" || target.Source == "supervisor") {
+					mergeInto(target, &svc)
+					continue
+				}
+			}
+		}
+
+		copySvc := svc
+		copySvc.dedupKey = key
+		merged[key] = &copySvc
+	}
+
+	out := make([]deploymentInventoryService, 0, len(merged))
+	for _, svc := range merged {
+		// 统一空值，避免出现空标签
+		if svc.Path == "" {
+			svc.Path = "unknown"
+		}
+		if svc.Exe == "" {
+			svc.Exe = "unknown"
+		}
+		if svc.Cwd == "" {
+			svc.Cwd = "unknown"
+		}
+		if svc.Root == "" {
+			svc.Root = "unknown"
+		}
+		if svc.User == "" {
+			svc.User = "unknown"
+		}
+		if svc.Status == "" {
+			svc.Status = "unknown"
+		}
+		if svc.Enabled == "" {
+			svc.Enabled = "unknown"
+		}
+		if svc.Middleware == "" {
+			svc.Middleware = "none"
+		}
+		out = append(out, *svc)
+	}
+
+	// 按最终暴露的标签组合二次去重：不同 dedupKey 的进程可能产生完全相同的标签，
+	// 若不合并 Prometheus 会因重复指标导致整个 /metrics 采集失败。
+	labelSeen := make(map[string]int, len(out))
+	deduped := make([]deploymentInventoryService, 0, len(out))
+	for _, svc := range out {
+		labelKey := strings.Join([]string{
+			svc.Name, svc.Path, svc.User, svc.StartupType, svc.Middleware,
+			svc.Cwd, svc.Exe, svc.Root, svc.Status, svc.Enabled, svc.Source,
+		}, "\x00")
+		if idx, ok := labelSeen[labelKey]; ok {
+			deduped[idx].instances += svc.instances
+			continue
+		}
+		labelSeen[labelKey] = len(deduped)
+		deduped = append(deduped, svc)
+	}
+	out = deduped
+
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		if out[i].StartupType != out[j].StartupType {
+			return out[i].StartupType < out[j].StartupType
+		}
+		return out[i].Exe < out[j].Exe
+	})
+
+	if len(out) > deploymentMaxServices {
+		log.Printf("[deployment_inventory] too many services (%d), truncated to %d", len(out), deploymentMaxServices)
+		out = out[:deploymentMaxServices]
+	}
+	return out
+}
+
+// deploymentMergeCrons 去重并限制定时任务条目数
+func deploymentMergeCrons(input []deploymentInventoryCron) []deploymentInventoryCron {
+	if len(input) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(input))
+	out := make([]deploymentInventoryCron, 0, len(input))
+	for _, cj := range input {
+		if cj.Cwd == "" {
+			cj.Cwd = "unknown"
+		}
+		if cj.User == "" {
+			cj.User = "unknown"
+		}
+		key := cj.Source + "|" + cj.Name + "|" + cj.Schedule + "|" + cj.Command + "|" + cj.User
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, cj)
+	}
+
+	// 按最终标签组合去重，避免重复指标导致 /metrics 采集失败
+	labelSeen := make(map[string]struct{}, len(out))
+	deduped := out[:0]
+	for _, cj := range out {
+		labelKey := strings.Join([]string{
+			cj.Name, cj.User, cj.Schedule, cj.Command, cj.Cwd, cj.Path, cj.Scope, cj.Source,
+		}, "\x00")
+		if _, ok := labelSeen[labelKey]; ok {
+			continue
+		}
+		labelSeen[labelKey] = struct{}{}
+		deduped = append(deduped, cj)
+	}
+	out = deduped
+
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Source < out[j].Source
+	})
+	if len(out) > deploymentMaxCronJobs {
+		log.Printf("[deployment_inventory] too many cron jobs (%d), truncated to %d", len(out), deploymentMaxCronJobs)
+		out = out[:deploymentMaxCronJobs]
+	}
+	return out
+}
+
+// ==========================================================================
+// 数据源：systemd
+// ==========================================================================
+
+type deploymentUnitDir struct {
+	path   string
+	custom bool // /etc/systemd/system 视为管理员自定义部署
+}
+
+func deploymentSystemdUnitDirs() []deploymentUnitDir {
+	candidates := []deploymentUnitDir{
+		{path: "/etc/systemd/system", custom: true},
+		{path: "/run/systemd/system", custom: false},
+		{path: "/usr/local/lib/systemd/system", custom: false},
+		{path: "/usr/lib/systemd/system", custom: false},
+		{path: "/lib/systemd/system", custom: false},
+	}
+	seen := make(map[string]struct{})
+	var seenInfo []os.FileInfo
+	out := make([]deploymentUnitDir, 0, len(candidates))
+	for _, c := range candidates {
+		full := deploymentHostPath(c.path)
+		info, err := os.Stat(full)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		// 通过 inode 去重，避免 /lib -> /usr/lib 等软链导致重复读取；
+		// 容器场景下不能对 /host/lib 做 EvalSymlinks（绝对软链会跳出 host root）。
+		duplicate := false
+		for _, existing := range seenInfo {
+			if os.SameFile(info, existing) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		seenInfo = append(seenInfo, info)
+		// 记录真实路径仅用于非容器场景的去重标记
+		if deploymentHostRoot() == "" {
+			if real, err := filepath.EvalSymlinks(full); err == nil {
+				if _, ok := seen[real]; ok {
+					continue
+				}
+				seen[real] = struct{}{}
+			}
+		}
+		out = append(out, deploymentUnitDir{path: full, custom: c.custom})
+	}
+	return out
+}
+
+// deploymentSystemdEnabledUnits 通过 *.wants / *.requires 软链判断 unit 是否开机启用
+func deploymentSystemdEnabledUnits(dirs []deploymentUnitDir) map[string]bool {
+	enabled := make(map[string]bool)
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir.path)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".wants") && !strings.HasSuffix(name, ".requires") {
+				continue
+			}
+			subEntries, err := os.ReadDir(filepath.Join(dir.path, name))
+			if err != nil {
+				continue
+			}
+			for _, sub := range subEntries {
+				enabled[sub.Name()] = true
+			}
+		}
+	}
+	return enabled
+}
+
+// deploymentSystemdRunningUnits 获取当前 running 的 systemd service（失败则返回空）
+func deploymentSystemdRunningUnits(ctx context.Context) (map[string]bool, bool) {
+	running := make(map[string]bool)
+	if deploymentHostRoot() != "" {
+		return running, false
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return running, false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--no-legend", "--plain")
+	out, err := cmd.Output()
+	if err != nil {
+		return running, false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "●")))
+		if len(fields) == 0 {
+			continue
+		}
+		if strings.HasSuffix(fields[0], ".service") {
+			running[fields[0]] = true
+		}
+	}
+	return running, true
+}
+
+type deploymentUnitConfig struct {
+	exec            string
+	user            string
+	workingDir      string
+	rootDir         string
+	hasInstall      bool
+	onCalendar      []string
+	onBootSec       string
+	onUnitActiveSec string
+	timerUnit       string
+}
+
+// deploymentParseUnitFile 解析 systemd .service / .timer 文件
+func deploymentParseUnitFile(path string) (*deploymentUnitConfig, error) {
+	data, err := deploymentReadFileLimited(path, deploymentMaxFileSize)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &deploymentUnitConfig{
+		user:       "root",
+		workingDir: "/",
+		rootDir:    "/",
+	}
+	section := ""
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.ToLower(strings.Trim(line, "[]"))
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(line[:idx]))
+		value := strings.TrimSpace(line[idx+1:])
+
+		switch section {
+		case "unit":
+			// [Unit] 段暂不需要额外字段
+		case "install":
+			cfg.hasInstall = true
+		case "service":
+			switch key {
+			case "execstart":
+				if cfg.exec == "" {
+					cfg.exec = deploymentParseExecStart(value)
+				}
+			case "user":
+				if value != "" {
+					cfg.user = value
+				}
+			case "workingdirectory":
+				if value != "" {
+					cfg.workingDir = strings.TrimPrefix(value, "-")
+				}
+			case "rootdirectory":
+				if value != "" {
+					cfg.rootDir = strings.TrimPrefix(value, "-")
+				}
+			}
+		case "timer":
+			switch key {
+			case "oncalendar":
+				cfg.onCalendar = append(cfg.onCalendar, value)
+			case "onbootsec":
+				cfg.onBootSec = value
+			case "onunitactivesec":
+				cfg.onUnitActiveSec = value
+			case "unit":
+				cfg.timerUnit = value
+			}
+		}
+	}
+	return cfg, scanner.Err()
+}
+
+// deploymentParseExecStart 提取 ExecStart 中的可执行文件路径
+func deploymentParseExecStart(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimLeft(value, "-@+!:")
+	fields := strings.Fields(value)
+	for i, field := range fields {
+		field = strings.Trim(field, `"'`)
+		field = strings.TrimLeft(field, "-@+!:")
+		if field == "" {
+			continue
+		}
+		// 处理 /usr/bin/env FOO=bar /opt/app 形式
+		if field == "env" || strings.HasSuffix(field, "/env") {
+			for _, next := range fields[i+1:] {
+				next = strings.Trim(next, `"'`)
+				if strings.HasPrefix(next, "/") {
+					return next
+				}
+				if strings.Contains(next, "=") {
+					continue
+				}
+				return next
+			}
+			continue
+		}
+		// 跳过环境变量赋值
+		if strings.Contains(field, "=") && !strings.HasPrefix(field, "/") {
+			continue
+		}
+		return field
+	}
+	return ""
+}
+
+// deploymentCollectSystemd 采集 systemd 服务
+func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+	dirs := deploymentSystemdUnitDirs()
+	if len(dirs) == 0 {
+		return nil, nil, nil
+	}
+
+	enabled := deploymentSystemdEnabledUnits(dirs)
+	running, haveRunning := deploymentSystemdRunningUnits(ctx)
+
+	type unitFile struct {
+		name   string
+		path   string
+		custom bool
+	}
+	unitMap := make(map[string]unitFile)
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir.path)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".service") || strings.Contains(name, "@.") {
+				continue
+			}
+			// 高优先级目录先占位
+			if _, ok := unitMap[name]; ok {
+				continue
+			}
+			unitMap[name] = unitFile{name: name, path: filepath.Join(dir.path, name), custom: dir.custom}
+		}
+	}
+
+	if len(unitMap) > deploymentMaxUnitFiles {
+		log.Printf("[deployment_inventory] too many systemd units (%d), truncated to %d", len(unitMap), deploymentMaxUnitFiles)
+	}
+
+	concurrency := deploymentInventoryConcurrency()
+	type unitResult struct {
+		svc *deploymentInventoryService
+		err error
+	}
+	jobs := make(chan unitFile)
+	results := make(chan unitResult, concurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for unit := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				svc, err := deploymentBuildSystemdService(unit.name, unit.path, unit.custom, enabled, running, haveRunning)
+				results <- unitResult{svc: svc, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		count := 0
+		for _, unit := range unitMap {
+			if count >= deploymentMaxUnitFiles {
+				break
+			}
+			select {
+			case jobs <- unit:
+				count++
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var services []deploymentInventoryService
+	for res := range results {
+		if res.err == nil && res.svc != nil {
+			services = append(services, *res.svc)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return services, nil, err
+	}
+	return services, nil, nil
+}
+
+func deploymentBuildSystemdService(unitName, unitPath string, custom bool, enabled, running map[string]bool, haveRunning bool) (*deploymentInventoryService, error) {
+	name := strings.TrimSuffix(unitName, ".service")
+	if deploymentIsSystemService(name) {
+		return nil, nil
+	}
+	cfg, err := deploymentParseUnitFile(unitPath)
+	if err != nil {
+		return nil, err
+	}
+
+	middleware := deploymentDetectMiddleware(name, cfg.exec, "", "")
+	isEnabled := enabled[unitName]
+	isRunning := running[unitName]
+
+	// 非自定义单元中，系统工具类命令（mount/plymouth/ldconfig 等）不视为业务部署
+	if !custom && middleware == "none" && deploymentIsSystemExec(cfg.exec) {
+		return nil, nil
+	}
+
+	// 包管理安装的非中间件服务，仅保留 enabled/running 的，避免系统服务刷屏
+	if !custom && !isEnabled && !isRunning && middleware == "none" {
+		return nil, nil
+	}
+
+	enabledValue := "false"
+	if isEnabled {
+		enabledValue = "true"
+	} else if !cfg.hasInstall {
+		enabledValue = "static"
+	}
+
+	status := "unknown"
+	if haveRunning {
+		if isRunning {
+			status = "running"
+		} else {
+			status = "inactive"
+		}
+	}
+
+	path := cfg.exec
+	if path == "" {
+		path = unitPath
+	}
+	return &deploymentInventoryService{
+		Name:        name,
+		Path:        path,
+		User:        cfg.user,
+		StartupType: "systemd",
+		Middleware:  middleware,
+		Cwd:         cfg.workingDir,
+		Exe:         cfg.exec,
+		Root:        cfg.rootDir,
+		Status:      status,
+		Enabled:     enabledValue,
+		Source:      "systemd",
+		dedupKey:    "systemd:" + unitName,
+		instances:   0,
+	}, nil
+}
+
+// ==========================================================================
+// 数据源：SysV init.d
+// ==========================================================================
+
+func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+	initDir := deploymentHostPath("/etc/init.d")
+	entries, err := os.ReadDir(initDir)
+	if err != nil {
+		return nil, nil, nil // 目录不存在视为无数据，不报错
+	}
+
+	enabled := make(map[string]bool)
+	rcPatterns := []string{"/etc/rc*.d/S*", "/etc/rc.d/rc*.d/S*"}
+	for _, pattern := range rcPatterns {
+		matches, _ := filepath.Glob(deploymentHostPath(pattern))
+		for _, match := range matches {
+			base := filepath.Base(match)
+			name := strings.TrimLeft(base, "S0123456789")
+			if name != "" {
+				enabled[name] = true
+			}
+		}
+	}
+
+	var services []deploymentInventoryService
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			break
+		}
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".dpkg-dist") ||
+			strings.HasSuffix(name, ".dpkg-old") || strings.HasSuffix(name, ".rpmnew") {
+			continue
+		}
+		if deploymentIsSystemService(name) {
+			continue
+		}
+		path := filepath.Join(initDir, name)
+		info, err := entry.Info()
+		if err != nil || info.Mode().IsDir() {
+			continue
+		}
+		middleware := deploymentDetectMiddleware(name, path, "", "")
+		// 未启用的 init.d 脚本（系统安装但未部署）默认不纳入清单，
+		// 可通过 DEPLOYMENT_INVENTORY_INCLUDE_DISABLED_INITD=true 打开。
+		if middleware == "none" && !enabled[name] &&
+			!deploymentEnvBool("DEPLOYMENT_INVENTORY_INCLUDE_DISABLED_INITD", false) {
+			continue
+		}
+		services = append(services, deploymentInventoryService{
+			Name:        name,
+			Path:        path,
+			User:        "unknown",
+			StartupType: "initd",
+			Middleware:  middleware,
+			Cwd:         "unknown",
+			Exe:         "unknown",
+			Root:        "/",
+			Status:      "unknown",
+			Enabled:     strconv.FormatBool(enabled[name]),
+			Source:      "initd",
+			dedupKey:    "initd:" + name,
+			instances:   0,
+		})
+	}
+	if err := ctx.Err(); err != nil {
+		return services, nil, err
+	}
+	return services, nil, nil
+}
+
+// ==========================================================================
+// 数据源：supervisor
+// ==========================================================================
+
+func deploymentSupervisorConfigFiles() []string {
+	candidates := []string{
+		"/etc/supervisord.conf",
+		"/etc/supervisor/supervisord.conf",
+		"/etc/supervisor/conf.d/*.conf",
+		"/etc/supervisord.d/*.conf",
+		"/etc/supervisord.d/*.ini",
+	}
+	seen := make(map[string]struct{})
+	var files []string
+	for _, candidate := range candidates {
+		matches, _ := filepath.Glob(deploymentHostPath(candidate))
+		for _, match := range matches {
+			if _, ok := seen[match]; ok {
+				continue
+			}
+			seen[match] = struct{}{}
+			files = append(files, match)
+		}
+	}
+	return files
+}
+
+func deploymentCollectSupervisor(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+	files := deploymentSupervisorConfigFiles()
+	if len(files) == 0 {
+		return nil, nil, nil
+	}
+
+	// 解析 include 配置
+	queue := append([]string(nil), files...)
+	seen := make(map[string]struct{}, len(files))
+	for len(queue) > 0 && len(seen) < 200 {
+		path := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		for _, include := range deploymentParseSupervisorIncludes(path) {
+			if !filepath.IsAbs(include) {
+				include = filepath.Join(filepath.Dir(path), include)
+			}
+			matches, _ := filepath.Glob(deploymentHostPath(strings.TrimPrefix(include, deploymentHostRoot())))
+			for _, match := range matches {
+				if _, ok := seen[match]; !ok {
+					queue = append(queue, match)
+				}
+			}
+		}
+	}
+
+	statusMap := deploymentSupervisorStatus(ctx)
+
+	type programConfig = deploymentSupervisorProgram
+	var programs []programConfig
+	for path := range seen {
+		if ctx.Err() != nil {
+			break
+		}
+		parsed, err := deploymentParseSupervisorPrograms(path)
+		if err != nil {
+			continue
+		}
+		programs = append(programs, parsed...)
+	}
+
+	var services []deploymentInventoryService
+	for _, p := range programs {
+		if deploymentIsSystemService(p.name) {
+			continue
+		}
+		exe := deploymentParseExecStart(p.command)
+		cwd := p.directory
+		if cwd == "" {
+			cwd = "unknown"
+		}
+		userName := p.user
+		if userName == "" || strings.Contains(userName, "%(") {
+			userName = "unknown"
+		}
+		enabled := "true"
+		if strings.EqualFold(p.autostart, "false") {
+			enabled = "false"
+		}
+		status := "unknown"
+		if state, ok := statusMap[p.name]; ok {
+			status = state
+		}
+		services = append(services, deploymentInventoryService{
+			Name:        p.name,
+			Path:        exe,
+			User:        userName,
+			StartupType: "supervisor",
+			Middleware:  deploymentDetectMiddleware(p.name, exe, p.command, ""),
+			Cwd:         cwd,
+			Exe:         exe,
+			Root:        "/",
+			Status:      status,
+			Enabled:     enabled,
+			Source:      "supervisor",
+			dedupKey:    "supervisor:" + p.name,
+			instances:   0,
+		})
+	}
+	if err := ctx.Err(); err != nil {
+		return services, nil, err
+	}
+	return services, nil, nil
+}
+
+func deploymentParseSupervisorIncludes(path string) []string {
+	data, err := deploymentReadFileLimited(path, deploymentMaxFileSize)
+	if err != nil {
+		return nil
+	}
+	var includes []string
+	section := ""
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.ToLower(strings.Trim(line, "[]"))
+			continue
+		}
+		if section != "include" {
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(line[:idx])) != "files" {
+			continue
+		}
+		for _, f := range strings.Fields(line[idx+1:]) {
+			includes = append(includes, f)
+		}
+	}
+	return includes
+}
+
+type deploymentSupervisorProgram struct {
+	name      string
+	command   string
+	directory string
+	user      string
+	autostart string
+}
+
+func deploymentParseSupervisorPrograms(path string) ([]deploymentSupervisorProgram, error) {
+	data, err := deploymentReadFileLimited(path, deploymentMaxFileSize)
+	if err != nil {
+		return nil, err
+	}
+	var programs []deploymentSupervisorProgram
+	var current *deploymentSupervisorProgram
+	section := ""
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.ToLower(strings.Trim(line, "[]"))
+			current = nil
+			if strings.HasPrefix(section, "program:") || strings.HasPrefix(section, "fcgi-program:") ||
+				strings.HasPrefix(section, "eventlistener:") {
+				idx := strings.Index(section, ":")
+				if idx >= 0 && idx+1 < len(section) {
+					programs = append(programs, deploymentSupervisorProgram{name: strings.TrimSpace(section[idx+1:])})
+					current = &programs[len(programs)-1]
+				}
+			}
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(line[:idx]))
+		value := strings.TrimSpace(line[idx+1:])
+		switch key {
+		case "command":
+			current.command = value
+		case "directory":
+			current.directory = value
+		case "user":
+			current.user = value
+		case "autostart":
+			current.autostart = value
+		}
+	}
+	return programs, scanner.Err()
+}
+
+func deploymentSupervisorStatus(ctx context.Context) map[string]string {
+	status := make(map[string]string)
+	if deploymentHostRoot() != "" {
+		return status
+	}
+	if _, err := exec.LookPath("supervisorctl"); err != nil {
+		return status
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "supervisorctl", "status").Output()
+	if err != nil {
+		return status
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		state := strings.ToLower(fields[1])
+		switch state {
+		case "running":
+			status[fields[0]] = "running"
+		case "stopped", "exited", "fatal", "backoff", "starting", "stopping":
+			status[fields[0]] = state
+		}
+	}
+	return status
+}
+
+// ==========================================================================
+// 数据源：docker
+// ==========================================================================
+
+func deploymentCollectDocker(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+	dockerBin, err := exec.LookPath("docker")
+	if err != nil {
+		return nil, nil, nil // 未安装 docker 视为无数据
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	format := `{{.Names}}|{{.Image}}|{{.State}}|{{.Label "com.docker.compose.project"}}`
+	out, err := exec.CommandContext(cctx, dockerBin, "ps", "-a", "--format", format).Output()
+	if err != nil {
+		return nil, nil, fmt.Errorf("docker ps failed: %w", err)
+	}
+
+	var services []deploymentInventoryService
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "|")
+		if len(fields) < 3 {
+			continue
+		}
+		name := strings.TrimPrefix(strings.TrimSpace(fields[0]), "/")
+		image := strings.TrimSpace(fields[1])
+		state := strings.ToLower(strings.TrimSpace(fields[2]))
+		if name == "" {
+			continue
+		}
+		status := state
+		switch state {
+		case "running":
+			status = "running"
+		case "exited", "created", "paused", "restarting", "dead", "removing":
+			// 保持 docker 原始状态
+		default:
+			status = "unknown"
+		}
+		services = append(services, deploymentInventoryService{
+			Name:        name,
+			Path:        image,
+			User:        "unknown",
+			StartupType: "docker",
+			Middleware:  deploymentDetectMiddleware(name, image, "", image),
+			Cwd:         "unknown",
+			Exe:         image,
+			Root:        "unknown",
+			Status:      status,
+			Enabled:     "true",
+			Source:      "docker",
+			dedupKey:    "docker:" + name,
+			instances:   1,
+		})
+	}
+	if err := ctx.Err(); err != nil {
+		return services, nil, err
+	}
+	return services, nil, nil
+}
+
+// ==========================================================================
+// 数据源：进程
+// ==========================================================================
+
+// deploymentProcessInfo 单个进程的原始信息
+type deploymentProcessInfo struct {
+	pid       int
+	name      string
+	exe       string
+	cwd       string
+	root      string
+	cmdline   string
+	uid       int
+	user      string
+	cgroup    string
+	unit      string
+	container string
+}
+
+func deploymentReadProcess(procRoot string, pid int) (*deploymentProcessInfo, bool) {
+	base := filepath.Join(procRoot, strconv.Itoa(pid))
+	info := &deploymentProcessInfo{pid: pid}
+
+	if data, err := deploymentReadFileLimited(filepath.Join(base, "comm"), 4096); err == nil {
+		info.name = strings.TrimSpace(string(data))
+	}
+	if data, err := deploymentReadFileLimited(filepath.Join(base, "cmdline"), 64*1024); err == nil {
+		info.cmdline = strings.TrimSpace(strings.ReplaceAll(string(data), "\x00", " "))
+	}
+	if link, err := os.Readlink(filepath.Join(base, "exe")); err == nil {
+		info.exe = deploymentCleanProcPath(link)
+	}
+	if link, err := os.Readlink(filepath.Join(base, "cwd")); err == nil {
+		info.cwd = deploymentCleanProcPath(link)
+	}
+	if link, err := os.Readlink(filepath.Join(base, "root")); err == nil {
+		info.root = deploymentCleanProcPath(link)
+	}
+	if data, err := deploymentReadFileLimited(filepath.Join(base, "status"), 64*1024); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "Uid:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if uid, err := strconv.Atoi(fields[1]); err == nil {
+						info.uid = uid
+					}
+				}
+				break
+			}
+		}
+	}
+	if data, err := deploymentReadFileLimited(filepath.Join(base, "cgroup"), 64*1024); err == nil {
+		info.cgroup = string(data)
+		info.unit, info.container = deploymentParseCgroup(string(data))
+	}
+
+	if info.name == "" {
+		info.name = filepath.Base(info.exe)
+	}
+	info.name = deploymentSanitizeLabel(info.name)
+	if info.name == "" && info.exe == "unknown" && info.cmdline == "" {
+		return nil, false
+	}
+	info.user = deploymentUserName(info.uid)
+	return info, true
+}
+
+// deploymentParseCgroup 解析 cgroup，返回 systemd service 单元和容器标识
+func deploymentParseCgroup(cgroup string) (unit, container string) {
+	for _, line := range strings.Split(cgroup, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 3)
+		path := parts[len(parts)-1]
+		lower := strings.ToLower(path)
+		if strings.Contains(lower, "/docker/") || strings.Contains(lower, "docker-") ||
+			strings.Contains(lower, "libpod-") || strings.Contains(lower, "/libpod/") {
+			container = "docker"
+		}
+		segments := strings.Split(path, "/")
+		for _, seg := range segments {
+			seg = strings.TrimSpace(seg)
+			if strings.HasSuffix(seg, ".service") {
+				unit = seg
+			}
+		}
+	}
+	return unit, container
+}
+
+func deploymentSanitizeLabel(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' || r == '"' {
+			return ' '
+		}
+		return r
+	}, value)
+}
+
+// deploymentShouldSkipContainerProcess 容器内进程默认跳过，由 docker 数据源统一提供容器清单
+func deploymentShouldSkipContainerProcess() bool {
+	if !deploymentEnvBool("DEPLOYMENT_INVENTORY_SKIP_CONTAINER_PROCESSES", true) {
+		return false
+	}
+	if !deploymentEnvBool("DEPLOYMENT_INVENTORY_DOCKER", true) {
+		return false
+	}
+	_, err := exec.LookPath("docker")
+	return err == nil
+}
+
+// deploymentCollectProcesses 并发扫描 /proc，构建进程级部署清单
+func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+	procRoot := deploymentProcRoot()
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read %s failed: %w", procRoot, err)
+	}
+
+	pids := make([]int, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 2 {
+			continue
+		}
+		pids = append(pids, pid)
+		if len(pids) >= deploymentMaxProcesses {
+			break
+		}
+	}
+
+	skipContainer := deploymentShouldSkipContainerProcess()
+	concurrency := deploymentInventoryConcurrency()
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	groups := make(map[string]*deploymentInventoryService)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pid := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				info, ok := deploymentReadProcess(procRoot, pid)
+				if !ok || info == nil {
+					continue
+				}
+				svc, keep := deploymentBuildProcessService(info, skipContainer)
+				if !keep || svc == nil {
+					continue
+				}
+				key := svc.dedupKey
+				mu.Lock()
+				if existing, ok := groups[key]; ok {
+					existing.instances++
+					// 补全缺失信息
+					if existing.Cwd == "unknown" && svc.Cwd != "unknown" {
+						existing.Cwd = svc.Cwd
+					}
+					if existing.Exe == "unknown" && svc.Exe != "unknown" {
+						existing.Exe = svc.Exe
+					}
+					if existing.Middleware == "none" && svc.Middleware != "none" {
+						existing.Middleware = svc.Middleware
+					}
+				} else {
+					copySvc := *svc
+					copySvc.instances = 1
+					groups[key] = &copySvc
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	for _, pid := range pids {
+		select {
+		case jobs <- pid:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return deploymentProcessGroupsToSlice(groups), nil, ctx.Err()
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return deploymentProcessGroupsToSlice(groups), nil, err
+	}
+	return deploymentProcessGroupsToSlice(groups), nil, nil
+}
+
+func deploymentProcessGroupsToSlice(groups map[string]*deploymentInventoryService) []deploymentInventoryService {
+	out := make([]deploymentInventoryService, 0, len(groups))
+	for _, svc := range groups {
+		out = append(out, *svc)
+	}
+	return out
+}
+
+func deploymentIsUserSessionCgroup(cgroup string) bool {
+	return strings.Contains(cgroup, "/user.slice/") || strings.Contains(cgroup, "user@")
+}
+
+// deploymentBuildProcessService 将进程信息转换为服务条目，返回 keep=false 表示排除
+func deploymentBuildProcessService(info *deploymentProcessInfo, skipContainer bool) (*deploymentInventoryService, bool) {
+	if info.pid <= 2 || info.pid == os.Getpid() {
+		return nil, false
+	}
+	if info.cmdline == "" && (info.exe == "" || info.exe == "unknown") {
+		return nil, false // 内核线程
+	}
+	if skipContainer && info.container != "" {
+		return nil, false
+	}
+	if deploymentIsSystemPath(info.exe) {
+		return nil, false
+	}
+	if deploymentIsSystemService(info.name) || deploymentIsInteractiveProcess(info.name) {
+		return nil, false
+	}
+	if info.exe != "" && info.exe != "unknown" {
+		exeBase := filepath.Base(info.exe)
+		if deploymentIsSystemService(exeBase) || deploymentIsInteractiveProcess(exeBase) {
+			return nil, false
+		}
+	}
+	if info.unit != "" && deploymentIsSystemService(info.unit) {
+		return nil, false
+	}
+
+	name := deploymentDeriveProcessName(info.name, info.cmdline, info.exe)
+	if name == "" {
+		name = info.name
+	}
+	if name == "" {
+		return nil, false
+	}
+
+	exe := info.exe
+	if exe == "" {
+		exe = "unknown"
+	}
+	cwd := info.cwd
+	if cwd == "" {
+		cwd = "unknown"
+	}
+	root := info.root
+	if root == "" {
+		root = "unknown"
+	}
+
+	startupType := "process"
+	key := ""
+	unitBase := strings.TrimSuffix(info.unit, ".service")
+	isAggregatorUnit := unitBase == "supervisord" || unitBase == "supervisor" ||
+		unitBase == "runsvdir" || unitBase == "s6-svscan"
+	if info.unit != "" && !isAggregatorUnit {
+		key = "systemd:" + info.unit
+		startupType = "systemd"
+		if name == "" {
+			name = unitBase
+		}
+	} else {
+		key = "process:" + deploymentNormalizeServiceName(name) + "|" + exe + "|" + cwd + "|" + info.user
+	}
+
+	middleware := deploymentDetectMiddleware(name, exe, info.cmdline, "")
+	// 开发工具/编辑器/桌面辅助进程不属于部署清单
+	if middleware == "none" && deploymentIsToolingProcess(name, exe, info.cmdline) {
+		return nil, false
+	}
+	// 可通过 DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES=false 排除用户登录会话进程
+	if middleware == "none" && deploymentIsUserSessionCgroup(info.cgroup) &&
+		!deploymentEnvBool("DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES", true) {
+		return nil, false
+	}
+
+	return &deploymentInventoryService{
+		Name:        name,
+		Path:        exe,
+		User:        info.user,
+		StartupType: startupType,
+		Middleware:  middleware,
+		Cwd:         cwd,
+		Exe:         exe,
+		Root:        root,
+		Status:      "running",
+		Enabled:     "unknown",
+		Source:      "process",
+		dedupKey:    key,
+		instances:   1,
+	}, true
+}
+
+// deploymentDeriveProcessName 从命令行推导更友好的服务名（如 java -jar app.jar -> app）
+func deploymentDeriveProcessName(comm, cmdline, exe string) string {
+	fields := strings.Fields(cmdline)
+	for i := 0; i < len(fields)-1; i++ {
+		if fields[i] == "-jar" {
+			base := filepath.Base(strings.Trim(fields[i+1], `"'`))
+			base = strings.TrimSuffix(base, ".jar")
+			base = strings.TrimSuffix(base, ".war")
+			if base != "" {
+				return deploymentSanitizeLabel(base)
+			}
+		}
+	}
+	// Linux comm 最长 15 字符，过长时优先使用可执行文件名，避免服务名被截断
+	if exe != "" && exe != "unknown" && (len(comm) >= 15 || comm == "") {
+		if base := deploymentSanitizeLabel(filepath.Base(exe)); base != "" {
+			return base
+		}
+	}
+	if comm != "" {
+		return deploymentSanitizeLabel(comm)
+	}
+	if exe != "" && exe != "unknown" {
+		return deploymentSanitizeLabel(filepath.Base(exe))
+	}
+	return ""
+}
+
+// ==========================================================================
+// 数据源：定时任务
+// ==========================================================================
+
+func deploymentCollectCron(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
+	var crons []deploymentInventoryCron
+
+	// 1. /etc/crontab（系统级，含 user 字段）
+	crons = append(crons, deploymentParseCronFile(deploymentHostPath("/etc/crontab"), "system", "", "crontab", true)...)
+
+	// 2. /etc/cron.d/*（系统级，含 user 字段）
+	if matches, _ := filepath.Glob(deploymentHostPath("/etc/cron.d/*")); len(matches) > 0 {
+		sort.Strings(matches)
+		for _, path := range matches {
+			if len(crons) >= deploymentMaxCronFiles {
+				break
+			}
+			info, err := os.Stat(path)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			crons = append(crons, deploymentParseCronFile(path, "system", "", "cron.d", true)...)
+		}
+	}
+
+	// 3. 用户 crontab：/var/spool/cron/crontabs/*（Debian）、/var/spool/cron/*（RHEL）
+	spoolPatterns := []string{"/var/spool/cron/crontabs/*", "/var/spool/cron/*"}
+	for _, pattern := range spoolPatterns {
+		matches, _ := filepath.Glob(deploymentHostPath(pattern))
+		for _, path := range matches {
+			info, err := os.Stat(path)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			userName := filepath.Base(path)
+			crons = append(crons, deploymentParseCronFile(path, "user", userName, "spool", false)...)
+		}
+	}
+
+	// 4. /etc/cron.{hourly,daily,weekly,monthly}/* 脚本
+	periods := []struct {
+		dir      string
+		schedule string
+	}{
+		{"/etc/cron.hourly", "@hourly"},
+		{"/etc/cron.daily", "@daily"},
+		{"/etc/cron.weekly", "@weekly"},
+		{"/etc/cron.monthly", "@monthly"},
+	}
+	for _, period := range periods {
+		entries, err := os.ReadDir(deploymentHostPath(period.dir))
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if ctx.Err() != nil {
+				break
+			}
+			if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			path := filepath.Join(deploymentHostPath(period.dir), entry.Name())
+			crons = append(crons, deploymentInventoryCron{
+				Name:     entry.Name(),
+				User:     "root",
+				Schedule: period.schedule,
+				Command:  path,
+				Cwd:      "unknown",
+				Path:     path,
+				Scope:    "system",
+				Source:   "cron." + strings.TrimPrefix(period.schedule, "@"),
+			})
+		}
+	}
+
+	// 5. systemd timer
+	crons = append(crons, deploymentCollectSystemdTimers(ctx)...)
+
+	if err := ctx.Err(); err != nil {
+		return nil, crons, err
+	}
+
+	// 可选：按 scope 过滤定时任务（all/user/system），默认 all
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_CRON_SCOPE"))) {
+	case "user":
+		filtered := crons[:0]
+		for _, cj := range crons {
+			if cj.Scope == "user" {
+				filtered = append(filtered, cj)
+			}
+		}
+		crons = filtered
+	case "system":
+		filtered := crons[:0]
+		for _, cj := range crons {
+			if cj.Scope == "system" {
+				filtered = append(filtered, cj)
+			}
+		}
+		crons = filtered
+	}
+
+	return nil, crons, nil
+}
+
+func deploymentParseCronFile(path, scope, defaultUser, source string, hasUserField bool) []deploymentInventoryCron {
+	data, err := deploymentReadFileLimited(path, deploymentMaxFileSize)
+	if err != nil {
+		return nil
+	}
+	var out []deploymentInventoryCron
+	lineNo := 0
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// 跳过环境变量行，如 SHELL=/bin/sh、MAILTO=""
+		eq := strings.Index(line, "=")
+		space := strings.IndexAny(line, " \t")
+		if eq > 0 && (space < 0 || eq < space) {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		var schedule, userName, command string
+		if strings.HasPrefix(fields[0], "@") {
+			schedule = fields[0]
+			if hasUserField {
+				if len(fields) < 3 {
+					continue
+				}
+				userName = fields[1]
+				command = strings.Join(fields[2:], " ")
+			} else {
+				userName = defaultUser
+				command = strings.Join(fields[1:], " ")
+			}
+		} else {
+			if len(fields) < 6 {
+				continue
+			}
+			schedule = strings.Join(fields[:5], " ")
+			if hasUserField {
+				if len(fields) < 7 {
+					continue
+				}
+				userName = fields[5]
+				command = strings.Join(fields[6:], " ")
+			} else {
+				userName = defaultUser
+				command = strings.Join(fields[5:], " ")
+			}
+		}
+		if userName == "" {
+			userName = defaultUser
+		}
+		if command == "" {
+			continue
+		}
+
+		out = append(out, deploymentInventoryCron{
+			Name:     fmt.Sprintf("%s:%d", filepath.Base(path), lineNo),
+			User:     userName,
+			Schedule: schedule,
+			Command:  command,
+			Cwd:      deploymentExtractCommandCwd(command),
+			Path:     path,
+			Scope:    scope,
+			Source:   source,
+		})
+	}
+	return out
+}
+
+// deploymentExtractCommandCwd 从 cron 命令中提取 cd 的工作目录
+func deploymentExtractCommandCwd(command string) string {
+	trimmed := strings.TrimSpace(command)
+	for _, prefix := range []string{"cd ", "cd\t"} {
+		if strings.HasPrefix(trimmed, prefix) {
+			rest := strings.TrimSpace(trimmed[len(prefix):])
+			idx := strings.IndexAny(rest, ";&|")
+			if idx >= 0 {
+				rest = rest[:idx]
+			}
+			dir := strings.Trim(strings.TrimSpace(rest), `"'`)
+			if dir != "" {
+				return dir
+			}
+		}
+	}
+	return "unknown"
+}
+
+// deploymentCollectSystemdTimers 采集 systemd timer（同时考虑 enabled / 自定义单元）
+func deploymentCollectSystemdTimers(ctx context.Context) []deploymentInventoryCron {
+	dirs := deploymentSystemdUnitDirs()
+	if len(dirs) == 0 {
+		return nil
+	}
+	enabled := deploymentSystemdEnabledUnits(dirs)
+	timerMap := make(map[string]struct {
+		path   string
+		custom bool
+	})
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir.path)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".timer") || strings.Contains(name, "@.") {
+				continue
+			}
+			if _, ok := timerMap[name]; ok {
+				continue
+			}
+			timerMap[name] = struct {
+				path   string
+				custom bool
+			}{path: filepath.Join(dir.path, name), custom: dir.custom}
+		}
+	}
+
+	var out []deploymentInventoryCron
+	for name, timer := range timerMap {
+		if ctx.Err() != nil {
+			break
+		}
+		base := strings.TrimSuffix(name, ".timer")
+		if deploymentIsSystemService(base) {
+			continue
+		}
+		cfg, err := deploymentParseUnitFile(timer.path)
+		if err != nil {
+			continue
+		}
+		middleware := deploymentDetectMiddleware(base, cfg.exec, "", "")
+		if !timer.custom && !enabled[name] && middleware == "none" {
+			continue
+		}
+
+		scheduleParts := append([]string(nil), cfg.onCalendar...)
+		if cfg.onBootSec != "" {
+			scheduleParts = append(scheduleParts, "OnBootSec="+cfg.onBootSec)
+		}
+		if cfg.onUnitActiveSec != "" {
+			scheduleParts = append(scheduleParts, "OnUnitActiveSec="+cfg.onUnitActiveSec)
+		}
+		schedule := strings.Join(scheduleParts, " ")
+		if schedule == "" {
+			schedule = "unknown"
+		}
+		serviceUnit := cfg.timerUnit
+		if serviceUnit == "" {
+			serviceUnit = base + ".service"
+		}
+		userName := "root"
+		servicePath := filepath.Join(filepath.Dir(timer.path), serviceUnit)
+		if svcCfg, err := deploymentParseUnitFile(servicePath); err == nil && svcCfg.user != "" {
+			userName = svcCfg.user
+		}
+		out = append(out, deploymentInventoryCron{
+			Name:     base,
+			User:     userName,
+			Schedule: schedule,
+			Command:  serviceUnit,
+			Cwd:      "unknown",
+			Path:     timer.path,
+			Scope:    "system",
+			Source:   "systemd-timer",
+		})
+	}
+	return out
+}
+
+// ==========================================================================
+// Prometheus Collector
+// ==========================================================================
+
+// DeploymentInventoryCollector 主机部署清单采集器
+type DeploymentInventoryCollector struct {
+	serviceInfoDesc     *prometheus.Desc
+	cronInfoDesc        *prometheus.Desc
+	servicesTotalDesc   *prometheus.Desc
+	cronTotalDesc       *prometheus.Desc
+	lastRefreshDesc     *prometheus.Desc
+	refreshDurationDesc *prometheus.Desc
+	refreshErrorsDesc   *prometheus.Desc
+	readyDesc           *prometheus.Desc
+	sourceUpDesc        *prometheus.Desc
+}
+
+// NewDeploymentInventoryCollector 创建部署清单采集器，并启动异步刷新协程
+func NewDeploymentInventoryCollector() *DeploymentInventoryCollector {
+	startDeploymentInventoryWorker()
+	return &DeploymentInventoryCollector{
+		serviceInfoDesc: prometheus.NewDesc(
+			"node_deployment_inventory_info",
+			"主机已安装部署的服务/中间件清单（值恒为1）",
+			[]string{
+				"service_name", "service_path", "service_user", "startup_type",
+				"middleware", "cwd", "exe", "root", "status", "enabled", "source",
+			}, nil,
+		),
+		cronInfoDesc: prometheus.NewDesc(
+			"node_deployment_inventory_cron_info",
+			"主机定时任务清单（值恒为1）",
+			[]string{"name", "user", "schedule", "command", "cwd", "path", "scope", "source"}, nil,
+		),
+		servicesTotalDesc: prometheus.NewDesc(
+			"node_deployment_inventory_services_total",
+			"主机部署清单中的服务/中间件总数", nil, nil,
+		),
+		cronTotalDesc: prometheus.NewDesc(
+			"node_deployment_inventory_cron_jobs_total",
+			"主机部署清单中的定时任务总数", nil, nil,
+		),
+		lastRefreshDesc: prometheus.NewDesc(
+			"node_deployment_inventory_last_refresh_timestamp_seconds",
+			"部署清单最后一次刷新完成的 Unix 时间戳", nil, nil,
+		),
+		refreshDurationDesc: prometheus.NewDesc(
+			"node_deployment_inventory_refresh_duration_seconds",
+			"部署清单最后一次刷新耗时（秒）", nil, nil,
+		),
+		refreshErrorsDesc: prometheus.NewDesc(
+			"node_deployment_inventory_refresh_errors_total",
+			"部署清单刷新过程中累计失败的数据源次数", nil, nil,
+		),
+		readyDesc: prometheus.NewDesc(
+			"node_deployment_inventory_ready",
+			"部署清单是否已完成首次加载（1=已就绪，0=加载中）", nil, nil,
+		),
+		sourceUpDesc: prometheus.NewDesc(
+			"node_deployment_inventory_source_up",
+			"部署清单各数据源最近一次刷新是否成功（1=成功，0=失败，失败时使用上次缓存）",
+			[]string{"source"}, nil,
+		),
+	}
+}
+
+// Describe 实现 prometheus.Collector 接口
+func (c *DeploymentInventoryCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.serviceInfoDesc
+	ch <- c.cronInfoDesc
+	ch <- c.servicesTotalDesc
+	ch <- c.cronTotalDesc
+	ch <- c.lastRefreshDesc
+	ch <- c.refreshDurationDesc
+	ch <- c.refreshErrorsDesc
+	ch <- c.readyDesc
+	ch <- c.sourceUpDesc
+}
+
+// Collect 实现 prometheus.Collector 接口：只读取内存快照，不执行任何阻塞操作
+func (c *DeploymentInventoryCollector) Collect(ch chan<- prometheus.Metric) {
+	snapshot := deploymentInventorySnapshotPtr.Load()
+	if snapshot == nil {
+		ch <- prometheus.MustNewConstMetric(c.readyDesc, prometheus.GaugeValue, 0)
+		ch <- prometheus.MustNewConstMetric(c.servicesTotalDesc, prometheus.GaugeValue, 0)
+		ch <- prometheus.MustNewConstMetric(c.cronTotalDesc, prometheus.GaugeValue, 0)
+		ch <- prometheus.MustNewConstMetric(c.lastRefreshDesc, prometheus.GaugeValue, 0)
+		ch <- prometheus.MustNewConstMetric(c.refreshDurationDesc, prometheus.GaugeValue, 0)
+		ch <- prometheus.MustNewConstMetric(c.refreshErrorsDesc, prometheus.CounterValue, float64(deploymentInventoryRefreshErrors.Load()))
+		return
+	}
+
+	ch <- prometheus.MustNewConstMetric(c.readyDesc, prometheus.GaugeValue, 1)
+
+	for _, svc := range snapshot.services {
+		ch <- prometheus.MustNewConstMetric(
+			c.serviceInfoDesc,
+			prometheus.GaugeValue,
+			1,
+			svc.Name,
+			svc.Path,
+			svc.User,
+			svc.StartupType,
+			svc.Middleware,
+			svc.Cwd,
+			svc.Exe,
+			svc.Root,
+			svc.Status,
+			svc.Enabled,
+			svc.Source,
+		)
+	}
+	for _, cj := range snapshot.crons {
+		ch <- prometheus.MustNewConstMetric(
+			c.cronInfoDesc,
+			prometheus.GaugeValue,
+			1,
+			cj.Name,
+			cj.User,
+			cj.Schedule,
+			cj.Command,
+			cj.Cwd,
+			cj.Path,
+			cj.Scope,
+			cj.Source,
+		)
+	}
+
+	ch <- prometheus.MustNewConstMetric(c.servicesTotalDesc, prometheus.GaugeValue, float64(len(snapshot.services)))
+	ch <- prometheus.MustNewConstMetric(c.cronTotalDesc, prometheus.GaugeValue, float64(len(snapshot.crons)))
+	ch <- prometheus.MustNewConstMetric(c.lastRefreshDesc, prometheus.GaugeValue, float64(snapshot.lastRefresh.Unix()))
+	ch <- prometheus.MustNewConstMetric(c.refreshDurationDesc, prometheus.GaugeValue, snapshot.duration.Seconds())
+	ch <- prometheus.MustNewConstMetric(c.refreshErrorsDesc, prometheus.CounterValue, float64(deploymentInventoryRefreshErrors.Load()))
+
+	for source, up := range snapshot.sourceUp {
+		ch <- prometheus.MustNewConstMetric(c.sourceUpDesc, prometheus.GaugeValue, up, source)
+	}
+}
+
+// Update 实现 node_exporter 自定义 Collector 接口
+func (c *DeploymentInventoryCollector) Update(ch chan<- prometheus.Metric) error {
+	c.Collect(ch)
+	return nil
+}
