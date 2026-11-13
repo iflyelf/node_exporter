@@ -30,6 +30,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -53,6 +54,8 @@ const (
 	deploymentMaxCronFiles = 2000
 	// deploymentMaxFileSize 单个配置文件最大读取字节数（1 MiB）
 	deploymentMaxFileSize = 1 << 20
+	// deploymentDefaultCacheTTL 数据源刷新失败时旧缓存默认保留时间
+	deploymentDefaultCacheTTL = 24 * time.Hour
 )
 
 // deploymentInventoryService 单条服务/中间件部署信息
@@ -87,11 +90,12 @@ type deploymentInventoryCron struct {
 
 // deploymentInventorySnapshot 只读快照，发布后不再修改
 type deploymentInventorySnapshot struct {
-	services    []deploymentInventoryService
-	crons       []deploymentInventoryCron
-	lastRefresh time.Time
-	duration    time.Duration
-	sourceUp    map[string]float64
+	services          []deploymentInventoryService
+	crons             []deploymentInventoryCron
+	lastRefresh       time.Time
+	duration          time.Duration
+	sourceUp          map[string]float64
+	sourceLastSuccess map[string]time.Time
 }
 
 var (
@@ -106,6 +110,9 @@ var (
 
 	// deploymentInventoryRefreshErrors 累计刷新错误次数（按数据源失败次数计）
 	deploymentInventoryRefreshErrors atomic.Uint64
+
+	// deploymentInventorySourceRunning 记录各数据源是否仍有一轮采集未返回
+	deploymentInventorySourceRunning sync.Map
 
 	// deploymentInventoryHostUsers 缓存宿主机 /etc/passwd 解析结果
 	deploymentInventoryHostUsersOnce sync.Once
@@ -391,6 +398,15 @@ func deploymentExtraIncludes() []string {
 	return out
 }
 
+// deploymentTruncateLabel 按字符数截断标签值，防止超长路径/命令行造成指标膨胀
+func deploymentTruncateLabel(value string, maxRunes int) string {
+	if maxRunes <= 0 || utf8.RuneCountInString(value) <= maxRunes {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:maxRunes])
+}
+
 func deploymentNormalizeServiceName(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	name = strings.TrimSuffix(name, ".service")
@@ -664,6 +680,27 @@ type deploymentInventorySource struct {
 	collect func(context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error)
 }
 
+// deploymentInventoryCommand 创建带超时和 WaitDelay 的外部命令。
+// WaitDelay 确保子进程被 context 取消后，即使有孙进程继承 stdout/stderr 管道，
+// Output() 也不会无限等待管道关闭。
+func deploymentInventoryCommand(ctx context.Context, timeout time.Duration, name string, args ...string) (*exec.Cmd, context.CancelFunc) {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	cmd := exec.CommandContext(cctx, name, args...)
+	cmd.WaitDelay = 2 * time.Second
+	return cmd, cancel
+}
+
+// deploymentInventoryAcquireSource 获取数据源执行权；若上一轮同名数据源仍未返回，
+// 本轮直接跳过，避免卡死的数据源在每次刷新时不断堆积 goroutine。
+func deploymentInventoryAcquireSource(name string) (*atomic.Bool, bool) {
+	value, _ := deploymentInventorySourceRunning.LoadOrStore(name, &atomic.Bool{})
+	flag := value.(*atomic.Bool)
+	if !flag.CompareAndSwap(false, true) {
+		return flag, false
+	}
+	return flag, true
+}
+
 // deploymentInventorySources 返回本次启用的数据源
 func deploymentInventorySources() []deploymentInventorySource {
 	sources := make([]deploymentInventorySource, 0, 6)
@@ -712,9 +749,21 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 
 	var wg sync.WaitGroup
 	for _, src := range sources {
+		flag, ok := deploymentInventoryAcquireSource(src.name)
+		if !ok {
+			// 上一轮该数据源仍未返回（例如卡在 NFS/命令管道），本轮直接跳过，
+			// 继续使用上一次成功快照，避免阻塞刷新和堆积 goroutine。
+			results[src.name] = deploymentInventorySourceResult{
+				name: src.name,
+				err:  fmt.Errorf("previous collection still running, skipped this round"),
+			}
+			log.Printf("[deployment_inventory] source %s is still running from previous refresh, skip this round", src.name)
+			continue
+		}
 		wg.Add(1)
-		go func(s deploymentInventorySource) {
+		go func(s deploymentInventorySource, running *atomic.Bool) {
 			defer wg.Done()
+			defer running.Store(false)
 			res := deploymentInventorySourceResult{name: s.name}
 			// 无论是否 panic 都必须回传结果，避免刷新流程等待不到该数据源
 			defer func() {
@@ -724,7 +773,7 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 				resultCh <- res
 			}()
 			res.services, res.crons, res.err = s.collect(ctx)
-		}(src)
+		}(src, flag)
 	}
 
 	// 所有数据源并发执行；全部结束后关闭 channel
@@ -751,9 +800,12 @@ collectLoop:
 		}
 	}
 
-	// 失败数据源保留上一次成功结果，避免指标抖动或清空
+	// 失败数据源在缓存 TTL 内保留上一次成功结果，超过 TTL 后丢弃，避免数据永久不更新
+	cacheTTL := deploymentEnvDuration("DEPLOYMENT_INVENTORY_CACHE_TTL", deploymentDefaultCacheTTL)
+	now := time.Now()
 	prevBySource := make(map[string][]deploymentInventoryService)
 	prevCronBySource := make(map[string][]deploymentInventoryCron)
+	prevLastSuccess := make(map[string]time.Time)
 	if prev != nil {
 		for _, svc := range prev.services {
 			prevBySource[svc.Source] = append(prevBySource[svc.Source], svc)
@@ -761,9 +813,13 @@ collectLoop:
 		for _, cj := range prev.crons {
 			prevCronBySource[cj.Source] = append(prevCronBySource[cj.Source], cj)
 		}
+		for source, last := range prev.sourceLastSuccess {
+			prevLastSuccess[source] = last
+		}
 	}
 
 	sourceUp := make(map[string]float64, len(sources))
+	sourceLastSuccess := make(map[string]time.Time, len(sources))
 	var services []deploymentInventoryService
 	var crons []deploymentInventoryCron
 	var errCount uint64
@@ -777,19 +833,32 @@ collectLoop:
 			if res.err != nil {
 				errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", src.name, res.err))
 			}
-			services = append(services, prevBySource[src.name]...)
-			if src.name == "cron" {
-				// cron 条目的 Source 细分为 crontab/cron.d/systemd-timer 等，
-				// 失败回退时统一使用上一轮全部 cron 缓存。
-				if prev != nil {
-					crons = append(crons, prev.crons...)
+
+			lastSuccess, hasSuccess := prevLastSuccess[src.name]
+			reuseCache := hasSuccess && now.Sub(lastSuccess) <= cacheTTL
+			if hasSuccess {
+				// 即使缓存过期，也保留最后成功时间，便于通过指标发现长期失败的数据源
+				sourceLastSuccess[src.name] = lastSuccess
+			}
+			if reuseCache {
+				services = append(services, prevBySource[src.name]...)
+				if src.name == "cron" {
+					// cron 条目的 Source 细分为 crontab/cron.d/systemd-timer 等，
+					// 失败回退时统一使用上一轮全部 cron 缓存。
+					if prev != nil {
+						crons = append(crons, prev.crons...)
+					}
+				} else {
+					crons = append(crons, prevCronBySource[src.name]...)
 				}
-			} else {
-				crons = append(crons, prevCronBySource[src.name]...)
+			} else if hasSuccess {
+				log.Printf("[deployment_inventory] source %s cache expired after %s without success, drop cached data",
+					src.name, time.Since(lastSuccess).Round(time.Second))
 			}
 			continue
 		}
 		sourceUp[src.name] = 1
+		sourceLastSuccess[src.name] = now
 		services = append(services, res.services...)
 		crons = append(crons, res.crons...)
 	}
@@ -798,11 +867,12 @@ collectLoop:
 	crons = deploymentMergeCrons(crons)
 
 	snapshot := &deploymentInventorySnapshot{
-		services:    services,
-		crons:       crons,
-		lastRefresh: time.Now(),
-		duration:    time.Since(start),
-		sourceUp:    sourceUp,
+		services:          services,
+		crons:             crons,
+		lastRefresh:       time.Now(),
+		duration:          time.Since(start),
+		sourceUp:          sourceUp,
+		sourceLastSuccess: sourceLastSuccess,
 	}
 	deploymentInventorySnapshotPtr.Store(snapshot)
 
@@ -975,6 +1045,18 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 		if svc.Middleware == "" {
 			svc.Middleware = "none"
 		}
+		// 限制标签长度，防止超长路径/命令行导致指标体积和高基数问题
+		svc.Name = deploymentTruncateLabel(svc.Name, 256)
+		svc.Path = deploymentTruncateLabel(svc.Path, 1024)
+		svc.User = deploymentTruncateLabel(svc.User, 128)
+		svc.StartupType = deploymentTruncateLabel(svc.StartupType, 32)
+		svc.Middleware = deploymentTruncateLabel(svc.Middleware, 64)
+		svc.Cwd = deploymentTruncateLabel(svc.Cwd, 1024)
+		svc.Exe = deploymentTruncateLabel(svc.Exe, 1024)
+		svc.Root = deploymentTruncateLabel(svc.Root, 512)
+		svc.Status = deploymentTruncateLabel(svc.Status, 32)
+		svc.Enabled = deploymentTruncateLabel(svc.Enabled, 32)
+		svc.Source = deploymentTruncateLabel(svc.Source, 32)
 		out = append(out, *svc)
 	}
 
@@ -1006,9 +1088,10 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 		return out[i].Exe < out[j].Exe
 	})
 
-	if len(out) > deploymentMaxServices {
-		log.Printf("[deployment_inventory] too many services (%d), truncated to %d", len(out), deploymentMaxServices)
-		out = out[:deploymentMaxServices]
+	maxServices := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_SERVICES", deploymentMaxServices)
+	if len(out) > maxServices {
+		log.Printf("[deployment_inventory] too many services (%d), truncated to %d", len(out), maxServices)
+		out = out[:maxServices]
 	}
 	return out
 }
@@ -1027,6 +1110,14 @@ func deploymentMergeCrons(input []deploymentInventoryCron) []deploymentInventory
 		if cj.User == "" {
 			cj.User = "unknown"
 		}
+		cj.Name = deploymentTruncateLabel(cj.Name, 256)
+		cj.User = deploymentTruncateLabel(cj.User, 128)
+		cj.Schedule = deploymentTruncateLabel(cj.Schedule, 512)
+		cj.Command = deploymentTruncateLabel(cj.Command, 2048)
+		cj.Cwd = deploymentTruncateLabel(cj.Cwd, 1024)
+		cj.Path = deploymentTruncateLabel(cj.Path, 1024)
+		cj.Scope = deploymentTruncateLabel(cj.Scope, 32)
+		cj.Source = deploymentTruncateLabel(cj.Source, 64)
 		key := cj.Source + "|" + cj.Name + "|" + cj.Schedule + "|" + cj.Command + "|" + cj.User
 		if _, ok := seen[key]; ok {
 			continue
@@ -1056,9 +1147,10 @@ func deploymentMergeCrons(input []deploymentInventoryCron) []deploymentInventory
 		}
 		return out[i].Source < out[j].Source
 	})
-	if len(out) > deploymentMaxCronJobs {
-		log.Printf("[deployment_inventory] too many cron jobs (%d), truncated to %d", len(out), deploymentMaxCronJobs)
-		out = out[:deploymentMaxCronJobs]
+	maxCronJobs := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_CRON_JOBS", deploymentMaxCronJobs)
+	if len(out) > maxCronJobs {
+		log.Printf("[deployment_inventory] too many cron jobs (%d), truncated to %d", len(out), maxCronJobs)
+		out = out[:maxCronJobs]
 	}
 	return out
 }
@@ -1153,9 +1245,8 @@ func deploymentSystemdRunningUnits(ctx context.Context) (map[string]bool, bool) 
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return running, false
 	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	cmd, cancel := deploymentInventoryCommand(ctx, 5*time.Second, "systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--no-legend", "--plain")
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--no-legend", "--plain")
 	out, err := cmd.Output()
 	if err != nil {
 		return running, false
@@ -1322,8 +1413,9 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 		}
 	}
 
-	if len(unitMap) > deploymentMaxUnitFiles {
-		log.Printf("[deployment_inventory] too many systemd units (%d), truncated to %d", len(unitMap), deploymentMaxUnitFiles)
+	maxUnits := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_UNIT_FILES", deploymentMaxUnitFiles)
+	if len(unitMap) > maxUnits {
+		log.Printf("[deployment_inventory] too many systemd units (%d), truncated to %d", len(unitMap), maxUnits)
 	}
 
 	concurrency := deploymentInventoryConcurrency()
@@ -1353,7 +1445,7 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 		defer close(jobs)
 		count := 0
 		for _, unit := range unitMap {
-			if count >= deploymentMaxUnitFiles {
+			if count >= maxUnits {
 				break
 			}
 			select {
@@ -1779,9 +1871,9 @@ func deploymentUpstartStatus(ctx context.Context) (map[string]string, bool) {
 	if bin == "" {
 		return status, false
 	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	cmd, cancel := deploymentInventoryCommand(ctx, 5*time.Second, bin, "list")
 	defer cancel()
-	out, err := exec.CommandContext(cctx, bin, "list").Output()
+	out, err := cmd.Output()
 	if err != nil {
 		return status, false
 	}
@@ -2101,9 +2193,9 @@ func deploymentSupervisorStatus(ctx context.Context) map[string]string {
 	if _, err := exec.LookPath("supervisorctl"); err != nil {
 		return status
 	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	cmd, cancel := deploymentInventoryCommand(ctx, 5*time.Second, "supervisorctl", "status")
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "supervisorctl", "status").Output()
+	out, err := cmd.Output()
 	if err != nil {
 		return status
 	}
@@ -2133,10 +2225,10 @@ func deploymentCollectDocker(ctx context.Context) ([]deploymentInventoryService,
 		return nil, nil, nil // 未安装 docker 视为无数据
 	}
 
-	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
 	format := `{{.Names}}|{{.Image}}|{{.State}}|{{.Label "com.docker.compose.project"}}`
-	out, err := exec.CommandContext(cctx, dockerBin, "ps", "-a", "--format", format).Output()
+	cmd, cancel := deploymentInventoryCommand(ctx, 15*time.Second, dockerBin, "ps", "-a", "--format", format)
+	defer cancel()
+	out, err := cmd.Output()
 
 	type containerRow struct {
 		name  string
@@ -2164,9 +2256,9 @@ func deploymentCollectDocker(ctx context.Context) ([]deploymentInventoryService,
 	} else {
 		// 老版本 Docker（如 CentOS 6 上的 Docker 1.x）可能不支持 --format，
 		// 回退到解析 `docker ps -a --no-trunc` 的普通输出。
-		cctx2, cancel2 := context.WithTimeout(ctx, 15*time.Second)
+		cmd2, cancel2 := deploymentInventoryCommand(ctx, 15*time.Second, dockerBin, "ps", "-a", "--no-trunc")
 		defer cancel2()
-		plain, err2 := exec.CommandContext(cctx2, dockerBin, "ps", "-a", "--no-trunc").Output()
+		plain, err2 := cmd2.Output()
 		if err2 != nil {
 			return nil, nil, fmt.Errorf("docker ps failed: %v (fallback: %v)", err, err2)
 		}
@@ -2365,6 +2457,7 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 	}
 
 	pids := make([]int, 0, len(entries))
+	maxProcesses := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_PROCESSES", deploymentMaxProcesses)
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -2374,7 +2467,7 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 			continue
 		}
 		pids = append(pids, pid)
-		if len(pids) >= deploymentMaxProcesses {
+		if len(pids) >= maxProcesses {
 			break
 		}
 	}
@@ -2580,6 +2673,7 @@ func deploymentDeriveProcessName(comm, cmdline, exe string) string {
 
 func deploymentCollectCron(ctx context.Context) ([]deploymentInventoryService, []deploymentInventoryCron, error) {
 	var crons []deploymentInventoryCron
+	maxCronFiles := deploymentEnvInt("DEPLOYMENT_INVENTORY_MAX_CRON_FILES", deploymentMaxCronFiles)
 
 	// 1. /etc/crontab（系统级，含 user 字段）
 	crons = append(crons, deploymentParseCronFile(deploymentHostPath("/etc/crontab"), "system", "", "crontab", true)...)
@@ -2588,7 +2682,7 @@ func deploymentCollectCron(ctx context.Context) ([]deploymentInventoryService, [
 	if matches, _ := filepath.Glob(deploymentHostPath("/etc/cron.d/*")); len(matches) > 0 {
 		sort.Strings(matches)
 		for _, path := range matches {
-			if len(crons) >= deploymentMaxCronFiles {
+			if len(crons) >= maxCronFiles {
 				break
 			}
 			info, err := os.Stat(path)
@@ -2921,15 +3015,16 @@ func deploymentCollectSystemdTimers(ctx context.Context) []deploymentInventoryCr
 
 // DeploymentInventoryCollector 主机部署清单采集器
 type DeploymentInventoryCollector struct {
-	serviceInfoDesc     *prometheus.Desc
-	cronInfoDesc        *prometheus.Desc
-	servicesTotalDesc   *prometheus.Desc
-	cronTotalDesc       *prometheus.Desc
-	lastRefreshDesc     *prometheus.Desc
-	refreshDurationDesc *prometheus.Desc
-	refreshErrorsDesc   *prometheus.Desc
-	readyDesc           *prometheus.Desc
-	sourceUpDesc        *prometheus.Desc
+	serviceInfoDesc       *prometheus.Desc
+	cronInfoDesc          *prometheus.Desc
+	servicesTotalDesc     *prometheus.Desc
+	cronTotalDesc         *prometheus.Desc
+	lastRefreshDesc       *prometheus.Desc
+	refreshDurationDesc   *prometheus.Desc
+	refreshErrorsDesc     *prometheus.Desc
+	readyDesc             *prometheus.Desc
+	sourceUpDesc          *prometheus.Desc
+	sourceLastSuccessDesc *prometheus.Desc
 }
 
 // NewDeploymentInventoryCollector 创建部署清单采集器，并启动异步刷新协程
@@ -2975,7 +3070,12 @@ func NewDeploymentInventoryCollector() *DeploymentInventoryCollector {
 		),
 		sourceUpDesc: prometheus.NewDesc(
 			"node_deployment_inventory_source_up",
-			"部署清单各数据源最近一次刷新是否成功（1=成功，0=失败，失败时使用上次缓存）",
+			"部署清单各数据源最近一次刷新是否成功（1=成功，0=失败；失败时在缓存 TTL 内沿用上次结果）",
+			[]string{"source"}, nil,
+		),
+		sourceLastSuccessDesc: prometheus.NewDesc(
+			"node_deployment_inventory_source_last_success_timestamp_seconds",
+			"部署清单各数据源最后一次采集成功的 Unix 时间戳（0=从未成功）",
 			[]string{"source"}, nil,
 		),
 	}
@@ -2992,6 +3092,7 @@ func (c *DeploymentInventoryCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.refreshErrorsDesc
 	ch <- c.readyDesc
 	ch <- c.sourceUpDesc
+	ch <- c.sourceLastSuccessDesc
 }
 
 // Collect 实现 prometheus.Collector 接口：只读取内存快照，不执行任何阻塞操作
@@ -3051,6 +3152,9 @@ func (c *DeploymentInventoryCollector) Collect(ch chan<- prometheus.Metric) {
 
 	for source, up := range snapshot.sourceUp {
 		ch <- prometheus.MustNewConstMetric(c.sourceUpDesc, prometheus.GaugeValue, up, source)
+	}
+	for source, last := range snapshot.sourceLastSuccess {
+		ch <- prometheus.MustNewConstMetric(c.sourceLastSuccessDesc, prometheus.GaugeValue, float64(last.Unix()), source)
 	}
 }
 

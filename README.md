@@ -126,7 +126,7 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
   - 支持 systemd / SysV init / Upstart / supervisor / Docker / 进程 / cron / anacron
   - 兼容 RHEL/CentOS 6、SUSE 12、Ubuntu 14 等老系统
   - 全异步加载，默认每 24 小时刷新一次，不阻塞 `/metrics`
-  - 数据源并发采集，带超时、防重入、失败回退与基数保护
+  - 数据源并发采集，带超时、卡死跳过、缓存过期与基数保护
   - 详见 [`my_collectors/deployment_inventory_collector.md`](my_collectors/deployment_inventory_collector.md)
 
 ---
@@ -157,6 +157,10 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 | `DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES` | `true` | 是否包含用户会话进程 |
 | `DEPLOYMENT_INVENTORY_EXCLUDE` | 空 | 额外排除项（逗号分隔） |
 | `DEPLOYMENT_INVENTORY_INCLUDE` | 空 | 强制包含项（逗号分隔） |
+| `DEPLOYMENT_INVENTORY_CACHE_TTL` | `24h` | 数据源失败时旧缓存最长保留时间 |
+| `DEPLOYMENT_INVENTORY_MAX_SERVICES` | `3000` | 服务/中间件最大条目数 |
+| `DEPLOYMENT_INVENTORY_MAX_CRON_JOBS` | `1000` | 定时任务最大条目数 |
+| `DEPLOYMENT_INVENTORY_MAX_PROCESSES` | `10000` | 单次最大扫描进程数 |
 
 ---
 

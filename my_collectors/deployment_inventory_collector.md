@@ -83,7 +83,8 @@ node_deployment_inventory_cron_info{
 | `node_deployment_inventory_last_refresh_timestamp_seconds` | Gauge | 最近一次刷新完成时间（Unix 时间戳） |
 | `node_deployment_inventory_refresh_duration_seconds` | Gauge | 最近一次刷新耗时 |
 | `node_deployment_inventory_refresh_errors_total` | Counter | 累计数据源刷新失败次数 |
-| `node_deployment_inventory_source_up{source}` | Gauge | 各数据源最近一次刷新是否成功（失败时使用上次缓存） |
+| `node_deployment_inventory_source_up{source}` | Gauge | 各数据源最近一次刷新是否成功（失败时在缓存 TTL 内沿用上次结果） |
+| `node_deployment_inventory_source_last_success_timestamp_seconds{source}` | Gauge | 各数据源最后一次采集成功时间（0=从未成功） |
 
 ---
 
@@ -109,6 +110,12 @@ node_deployment_inventory_cron_info{
 | `DEPLOYMENT_INVENTORY_SKIP_CONTAINER_PROCESSES` | `true` | 是否跳过 Docker cgroup 内进程（避免与容器清单重复） |
 | `DEPLOYMENT_INVENTORY_EXCLUDE` | 空 | 额外排除项，逗号分隔，按名称子串匹配 |
 | `DEPLOYMENT_INVENTORY_INCLUDE` | 空 | 强制包含项（优先级高于系统服务排除），逗号分隔 |
+| `DEPLOYMENT_INVENTORY_CACHE_TTL` | `24h` | 数据源刷新失败时旧缓存最长保留时间，超过后丢弃该数据源旧数据 |
+| `DEPLOYMENT_INVENTORY_MAX_SERVICES` | `3000` | 服务/中间件最大条目数 |
+| `DEPLOYMENT_INVENTORY_MAX_CRON_JOBS` | `1000` | 定时任务最大条目数 |
+| `DEPLOYMENT_INVENTORY_MAX_PROCESSES` | `10000` | 单次最大扫描进程数 |
+| `DEPLOYMENT_INVENTORY_MAX_UNIT_FILES` | `5000` | 单次最大解析 systemd 单元数 |
+| `DEPLOYMENT_INVENTORY_MAX_CRON_FILES` | `2000` | 单次最大解析 cron 文件数 |
 
 > 建议采集宿主机时挂载 `/proc`、`/etc/systemd`、`/etc/init.d`、`/etc/init`、`/etc/supervisor`、
 > `/etc/cron*`、`/var/spool/cron`，并设置 `DEPLOYMENT_INVENTORY_HOST_ROOT` 与 `DEPLOYMENT_INVENTORY_PROC`。
@@ -141,13 +148,23 @@ node_deployment_inventory_cron_info{
 2. **每日刷新**：默认 `ticker` 周期 24 小时，刷新完成后一次性替换快照。
 3. **并发采集**：systemd/initd/upstart/supervisor/docker/process/cron 数据源并发执行；
    systemd 单元与 `/proc` 进程均有固定大小工作池，避免 goroutine 数量失控。
-4. **超时控制**：整体刷新有 `context` 超时，`systemctl`、`supervisorctl`、`docker` 等外部命令另有 5–15 秒超时。
-5. **防重入**：`sync.Mutex.TryLock()` 保证上一轮未结束时不会重复刷新，也不会阻塞抓取。
-6. **防死锁**：刷新过程中不持有全局锁执行 I/O；各数据源结果先写入本地集合，最后统一合并；
+4. **超时控制**：整体刷新有 `context` 超时（默认 90s），并额外设置硬超时（+15s）；
+   `systemctl`、`supervisorctl`、`docker`、`initctl` 等外部命令另有 5–15 秒超时，
+   且设置 `WaitDelay=2s`，即使孙进程继承管道也不会无限等待。
+5. **卡死跳过**：每个数据源有独立的执行中标记；若上一轮数据源卡住未返回，
+   下一轮刷新直接跳过该数据源并沿用缓存，不会持续堆积 goroutine，也不会阻塞 `/metrics`。
+6. **防重入**：`sync.Mutex.TryLock()` 保证上一轮刷新未结束时不会重复进入，且不阻塞抓取。
+7. **防死锁**：刷新过程中不持有全局锁执行 I/O；各数据源结果先写入本地集合，最后统一合并；
    快照发布使用原子替换，无锁竞争。
-7. **失败回退**：每个数据源独立标记成功/失败；失败时沿用该数据源上一次成功结果，
-   避免一次扫描失败导致业务指标整体消失。
-8. **基数保护**：服务最多 3000 条、定时任务 1000 条、进程 10000 个，超出后截断并记录日志。
+8. **缓存过期**：数据源失败时仅在 `DEPLOYMENT_INVENTORY_CACHE_TTL`（默认 24h）内沿用旧结果；
+   超过 TTL 后主动丢弃该数据源缓存，保证不会出现“数据永远不更新”。
+   每个数据源的最后成功时间可通过 `node_deployment_inventory_source_last_success_timestamp_seconds` 观察。
+9. **基数保护**：服务默认最多 3000 条、定时任务 1000 条、进程 10000 个、systemd 单元 5000 个，
+   超出后截断并记录日志；可通过 `DEPLOYMENT_INVENTORY_MAX_*` 环境变量调整。
+10. **标签长度限制**：路径、cwd、exe、命令行等标签按字符数截断（256–2048 字符），
+    避免超长路径或异常命令行撑大指标体积。
+11. **最终标签去重**：按最终暴露的完整标签组合二次去重，避免不同数据源产生重复指标导致
+    Prometheus 抓取整体失败。
 
 ---
 
@@ -199,6 +216,13 @@ node_deployment_inventory_cron_info{scope="user"}
 
 # 清单是否已完成首次加载
 node_deployment_inventory_ready == 0
+
+# 超过 24 小时未成功采集的数据源（数据可能过期）
+time() - node_deployment_inventory_source_last_success_timestamp_seconds > 86400
+
+# 部署清单条目数量（观察基数）
+node_deployment_inventory_services_total
+node_deployment_inventory_cron_jobs_total
 ```
 
 ---
@@ -214,3 +238,14 @@ node_deployment_inventory_ready == 0
   - 需挂载宿主机 `/proc` 并设置 `DEPLOYMENT_INVENTORY_PROC`、`DEPLOYMENT_INVENTORY_HOST_ROOT`。
 - **清单更新不及时？**
   - 默认 24 小时刷新一次，可通过 `DEPLOYMENT_INVENTORY_INTERVAL` 调整；修改后需重启 node_exporter。
+- **指标数量过多/抓取变慢？**
+  - 调低 `DEPLOYMENT_INVENTORY_MAX_SERVICES`、`DEPLOYMENT_INVENTORY_MAX_CRON_JOBS`，
+    或通过 `DEPLOYMENT_INVENTORY_EXCLUDE` 排除测试/临时进程。
+- **某个数据源一直失败，旧数据会保留多久？**
+  - 默认最多 `DEPLOYMENT_INVENTORY_CACHE_TTL=24h`；超过后丢弃该数据源旧缓存。
+    默认刷新周期与 TTL 同为 24h，因此一次失败后下一轮就会丢弃旧数据；
+    若希望容忍一次失败，可将 `DEPLOYMENT_INVENTORY_CACHE_TTL` 调为 `48h`。
+    可通过 `node_deployment_inventory_source_last_success_timestamp_seconds` 判断数据是否过期。
+- **采集卡住会不会拖垮 node_exporter？**
+  - 不会。`/metrics` 只读内存快照；刷新有整体超时与硬超时，卡住的数据源下一轮会被跳过，
+    不会阻塞抓取或无限堆积 goroutine。
