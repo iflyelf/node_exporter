@@ -8,7 +8,7 @@
 - **默认不采集 Docker/Kubernetes 容器，容器 cgroup 内进程也默认跳过，避免高基数与卡死**
 - **全异步刷新，`/metrics` 只读内存快照，不阻塞 Prometheus 抓取**
 - **默认每 24 小时刷新一次，首次启动立即在后台加载**
-- **各数据源并发采集，进程扫描使用固定工作池，外部命令带超时**
+- **不执行任何外部命令，不 readlink 业务路径，只读取 procfs 与本地配置文件**
 - **单个数据源失败时保留其上一次成功结果，避免指标突然消失**
 
 ---
@@ -21,7 +21,7 @@
 | `initd` | 扫描 `/etc/init.d`，通过 `/etc/rc*.d/S*` 判断是否启用 |
 | `upstart` | 解析 `/etc/init/*.conf` 与 `.override`，兼容 Ubuntu 14、RHEL 6 等 Upstart 系统 |
 | `supervisor` | 解析 `/etc/supervisor/supervisord.conf`、`/etc/supervisor/conf.d/*.conf`、`/etc/supervisord.conf`、`/etc/supervisord.d/*` 中的 program |
-| `process` | 并发扫描 `/proc/<pid>`，读取 `exe`、`cwd`、`root`、`cmdline`、`cgroup`、UID 等 |
+| `process` | 并发扫描 `/proc/<pid>`，读取 `cmdline`、`environ(PWD)`、`cgroup`、`status(UID)` 等 procfs 内存文件 |
 
 进程扫描会通过 cgroup 将进程关联到 systemd 单元，并与 systemd/supervisor/initd 条目合并去重。
 **Docker / Kubernetes containerd 容器默认不采集**，容器 cgroup 内进程也默认跳过，
@@ -45,13 +45,13 @@ node_deployment_inventory_info{
 |------|------|
 | `service_name` | 服务名（systemd 单元名去后缀、进程名或 jar 名） |
 | `service_path` | 服务路径（ExecStart、init/upstart 脚本、可执行文件等） |
-| `service_user` | 运行用户 |
+| `service_user` | 运行用户；优先本地 `/etc/passwd`，否则显示数字 UID |
 | `startup_type` | 启动方式：`systemd` / `initd` / `upstart` / `supervisor` / `process` |
 | `middleware` | 中间件类型（`nginx`、`mysql`、`redis`、`kafka` 等），未识别为 `none` |
-| `cwd` | 进程工作目录；systemd 默认 `/`，无法获取时为 `unknown` |
-| `exe` | 可执行文件路径 |
-| `root` | 进程根目录（`/proc/<pid>/root`），无法获取时为 `unknown` |
-| `status` | `running` / `inactive` / `unknown` |
+| `cwd` | 进程工作目录，优先取 `environ` 中的 `PWD`；systemd 取 `WorkingDirectory`；否则 `unknown` |
+| `exe` | 可执行文件路径，取自 `cmdline[0]`，不读取 `/proc/<pid>/exe` 链接 |
+| `root` | systemd 取 `RootDirectory`（默认 `/`）；进程条目固定 `unknown`，不读取 `/proc/<pid>/root` |
+| `status` | `running`（进程 cgroup 命中）/ `unknown`（未命中进程） |
 | `enabled` | 是否开机启动：`true` / `false` / `static` / `unknown` |
 | `source` | 数据来源：`systemd` / `initd` / `upstart` / `supervisor` / `process` |
 
@@ -86,7 +86,6 @@ node_deployment_inventory_info{
 | `DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES` | `true` | 是否采集用户会话中的进程；设为 `false` 只保留系统级部署 |
 | `DEPLOYMENT_INVENTORY_INCLUDE_DISABLED_INITD` | `false` | 是否包含未启用的 init.d 脚本 |
 | `DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES` | `false` | 是否采集容器 cgroup 内进程（默认关闭，避免容器/Pod 高基数与卡死） |
-| `DEPLOYMENT_INVENTORY_PROC_LINKS` | `auto` | `/proc/<pid>/{exe,cwd,root}` 读取策略：`auto`（检测到 NFS/Ceph 等网络文件系统时跳过）/`all`/`none` |
 | `DEPLOYMENT_INVENTORY_EXCLUDE` | 空 | 额外排除项，逗号分隔，按名称子串匹配 |
 | `DEPLOYMENT_INVENTORY_INCLUDE` | 空 | 强制包含项（优先级高于系统服务排除），逗号分隔 |
 | `DEPLOYMENT_INVENTORY_CACHE_TTL` | `24h` | 数据源刷新失败时旧缓存最长保留时间，超过后丢弃该数据源旧数据 |
@@ -102,14 +101,13 @@ node_deployment_inventory_info{
 |------|----------|------|
 | RHEL / CentOS 6 | SysV init + Upstart | 解析 `/etc/init.d`、`/etc/rc.d/rc*.d/S*`、`/etc/init/*.conf`；无 systemd 时自动跳过 |
 | SUSE / SLES 12 | systemd + SysV 兼容层 | 解析 systemd 单元、`/etc/init.d/rc*.d/S*` |
-| Ubuntu 14 | Upstart | 解析 `/etc/init/*.conf`，读取 `exec`、`script`、`setuid`、`chdir`、`start on` 与 `.override`；通过 `initctl list` 获取运行状态 |
+| Ubuntu 14 | Upstart | 解析 `/etc/init/*.conf`，读取 `exec`、`script`、`setuid`、`chdir`、`start on` 与 `.override` |
 
 老系统上请注意：
 
 1. 使用 CI 的 **legacy 二进制**（Go 1.23 编译，支持 kernel 2.6.32–3.10）；
 2. SysV init 脚本会解析 `DAEMON`/`PROG`/`USER`/`DAEMON_USER`/`chdir`，并与 `/proc` 进程按 exe 合并，兼容“服务名与进程名不一致”的场景；
 3. 无 systemd 时 `status` 主要来自进程合并，`systemd` 数据源为空但不会报错；
-4. Upstart 的 `initctl` 位于 `/sbin` 或 `/usr/sbin`，采集器会按绝对路径查找；
 
 ---
 
@@ -130,17 +128,23 @@ export DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true
 > 该开关只影响容器内进程，不会执行 `docker ps` / `crictl` 等容器运行时命令；
 > 大规模 Pod 环境建议保持关闭。
 
-### NFS / Ceph 挂死防护
+### 无阻塞采集设计
 
-`/proc` 本身是本地虚拟文件系统，主要风险来自 `readlink /proc/<pid>/{exe,cwd,root}` 时进入业务 NFS/Ceph 路径。采集器提供：
+采集器**不执行任何外部命令**（systemctl/supervisorctl/initctl/docker/crictl 均不调用），
+也**不读取** `/proc/<pid>/{exe,cwd,root}` 链接，因此不会因业务 NFS/Ceph 路径进入 D 状态：
 
-| `DEPLOYMENT_INVENTORY_PROC_LINKS` | 行为 |
-|-----------------------------------|------|
-| `auto`（默认） | 读取 `/proc/<pid>/mountinfo`，发现 `nfs`、`nfs4`、`ceph`、`cifs`、`glusterfs`、`fuse.*`、`lustre`、`9p`、`ocfs2` 等网络/集群文件系统时，跳过该进程的 `exe/cwd/root` readlink |
-| `all` | 保持原有行为，全部读取链接 |
-| `none` | 完全不读取链接，`exe` 仅从 `cmdline[0]` 提取，`cwd/root` 为 `unknown` |
+- `exe` 取自 `cmdline[0]`；
+- `cwd` 取自 `environ` 中的 `PWD`；
+- 进程条目的 `root` 固定为 `unknown`，systemd 条目取配置中的 `RootDirectory`；
+- 运行状态由进程 cgroup 合并得到，不再调用 systemctl/initctl/supervisorctl；
+- systemd/init.d/upstart/supervisor 配置目录如果位于网络文件系统，通过
+  `/proc/self/mountinfo` 判断后直接跳过，不 open/stat 这些路径；
+- `/etc/passwd` 仅在本地普通文件时读取，否则用户显示为 UID 数字。
 
-> 建议存在 NFS/Ceph 挂死风险的节点保持 `auto`；极端场景可设为 `none`，以损失部分 cwd/exe 信息换取最高安全性。
+> `/proc` 是内存虚拟文件系统，读取 cmdline/cgroup/status/environ 不涉及业务磁盘路径。
+> 配置目录在本地磁盘时才会读取；网络挂载配置目录会被跳过。
+
+
 
 ---
 
@@ -150,10 +154,9 @@ export DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true
    `Collect()` 仅通过 `atomic.Pointer` 读取不可变快照，抓取延迟与主机进程数无关。
 2. **每日刷新**：默认 `ticker` 周期 24 小时，刷新完成后一次性替换快照。
 3. **并发采集**：systemd/initd/upstart/supervisor/process 数据源并发执行；
-   systemd 单元与 `/proc` 进程均有固定大小工作池，避免 goroutine 数量失控。
+   systemd 单元与 `/proc` 进程均有固定大小工作池；进程扫描只读 procfs。
 4. **超时控制**：整体刷新有 `context` 超时（默认 90s），并额外设置硬超时（+15s）；
-   `systemctl`、`supervisorctl`、`initctl` 等外部命令另有 5–15 秒超时，
-   且设置 `WaitDelay=2s`，即使孙进程继承管道也不会无限等待。
+   不执行外部命令，不存在子进程管道等待问题。
 5. **卡死跳过**：每个数据源有独立的执行中标记；若上一轮数据源卡住未返回，
    下一轮刷新直接跳过该数据源并沿用缓存，不会持续堆积 goroutine，也不会阻塞 `/metrics`。
 6. **防重入**：`sync.Mutex.TryLock()` 保证上一轮刷新未结束时不会重复进入，且不阻塞抓取。
@@ -166,8 +169,8 @@ export DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true
    避免超长路径或异常命令行撑大指标体积。
 10. **服务去重**：先按服务名（忽略大小写与 `.service/.sh` 等后缀）合并同名服务，
     再按最终标签组合二次去重，保证同一服务只有一条指标且不会触发重复指标错误。
-11. **内存控制**：`/proc` 采用流式读取，避免一次性保存全部 PID；相同 mount namespace
-    的 `mountinfo` 只解析一次；UID 用户名缓存与 namespace 缓存均有上限，防止长期增长。
+11. **内存控制**：`/proc` 采用流式读取，避免一次性保存全部 PID；挂载信息每次刷新重新解析；
+    UID 用户名缓存有上限，防止长期增长。
 12. **无界条目采集**：服务清单不设条数上限；通过系统服务过滤、容器进程跳过、同名去重
     控制最终指标规模。
 

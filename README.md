@@ -127,7 +127,7 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
   - 默认不采集 Docker / Kubernetes 容器，容器进程默认跳过，避免高基数与卡死
   - 兼容 RHEL/CentOS 6、SUSE 12、Ubuntu 14 等老系统
   - 全异步加载，默认每 24 小时刷新一次，不阻塞 `/metrics`
-  - 数据源并发采集，带超时、卡死跳过、缓存过期、同名去重与内存控制
+  - 数据源并发采集，不执行外部命令、不 readlink 业务路径，带超时、卡死跳过、缓存过期与去重
   - 详见 [`my_collectors/deployment_inventory_collector.md`](my_collectors/deployment_inventory_collector.md)
 
 ---
@@ -154,7 +154,6 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 | `DEPLOYMENT_INVENTORY_HOST_ROOT` | 空 | 容器采集宿主机时的宿主机根目录 |
 | `DEPLOYMENT_INVENTORY_PROC` | `PROC_PREFIX` 或 `/proc` | 部署清单使用的 /proc 路径 |
 | `DEPLOYMENT_INVENTORY_UPSTART` | `true` | 是否采集 Upstart 服务（Ubuntu 14 / RHEL 6） |
-| `DEPLOYMENT_INVENTORY_PROC_LINKS` | `auto` | 网络文件系统下跳过 exe/cwd/root 链接读取 |
 | `DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES` | `false` | 是否采集容器 cgroup 内进程 |
 | `DEPLOYMENT_INVENTORY_INCLUDE_USER_PROCESSES` | `true` | 是否包含用户会话进程 |
 | `DEPLOYMENT_INVENTORY_EXCLUDE` | 空 | 额外排除项（逗号分隔） |

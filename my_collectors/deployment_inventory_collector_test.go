@@ -70,6 +70,41 @@ func TestDeploymentIsNetworkFSType(t *testing.T) {
 	}
 }
 
+func TestDeploymentPwdFromEnviron(t *testing.T) {
+	data := []byte("PATH=/usr/bin\x00PWD=/opt/app\x00HOME=/root\x00")
+	if got := deploymentPwdFromEnviron(data); got != "/opt/app" {
+		t.Fatalf("PWD parse = %q, want /opt/app", got)
+	}
+	if got := deploymentPwdFromEnviron([]byte("PATH=/usr/bin\x00")); got != "" {
+		t.Fatalf("PWD missing should return empty, got %q", got)
+	}
+}
+
+func TestDeploymentPathNetworkFSGuard(t *testing.T) {
+	mounts := []deploymentMountInfo{
+		{point: "/", fstype: "ext4"},
+		{point: "/data", fstype: "ceph"},
+		{point: "/mnt/ceph/sub", fstype: "nfs4"},
+	}
+	deploymentSelfMountsPtr.Store(&mounts)
+	defer deploymentSelfMountsPtr.Store(nil)
+
+	cases := []struct {
+		path    string
+		network bool
+	}{
+		{"/etc/systemd/system", false},
+		{"/data/app", true},
+		{"/mnt/ceph/sub/dir", true},
+		{"/data-other", false},
+	}
+	for _, c := range cases {
+		if got := deploymentIsPathOnNetworkFS(c.path); got != c.network {
+			t.Fatalf("IsPathOnNetworkFS(%q) = %v, want %v", c.path, got, c.network)
+		}
+	}
+}
+
 func TestDeploymentParseCgroup(t *testing.T) {
 	cases := []struct {
 		cgroup    string

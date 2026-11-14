@@ -9,20 +9,17 @@
 //  3. 默认排除操作系统自带服务、内核线程与容器进程，只保留业务部署与中间件；
 //  4. 全异步刷新：Collect() 只读取内存快照，绝不阻塞 /metrics；
 //  5. 默认每 24 小时刷新一次，首次启动立即在后台刷新；
-//  6. 所有外部命令带超时，进程扫描使用固定大小工作池，避免高并发/死锁；
+//  6. 不执行外部命令、不 readlink 业务路径；进程扫描使用固定大小工作池，避免高并发/死锁；
 //  7. 任一数据源刷新失败时保留该数据源上一次成功结果，避免指标突然消失。
 package my_collectors
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -101,10 +98,6 @@ var (
 	// deploymentInventoryUserCache 缓存 UID -> 用户名，避免重复 NSS 查询
 	deploymentInventoryUserCache      sync.Map
 	deploymentInventoryUserCacheCount atomic.Int64
-
-	// deploymentNetworkFSCache 缓存 mount namespace -> 是否包含网络文件系统
-	deploymentNetworkFSCache      sync.Map
-	deploymentNetworkFSCacheCount atomic.Int64
 
 	// 额外包含/排除项解析一次，避免每个进程/单元重复 split+分配
 	deploymentExtraExcludesOnce sync.Once
@@ -608,7 +601,11 @@ func deploymentCleanProcPath(p string) string {
 func deploymentLoadHostUsers() map[int]string {
 	deploymentInventoryHostUsersOnce.Do(func() {
 		deploymentInventoryHostUsersMap = make(map[int]string)
-		data, err := deploymentReadFileLimited(deploymentHostPath("/etc/passwd"), deploymentMaxFileSize)
+		passwdPath := deploymentHostPath("/etc/passwd")
+		if !deploymentSafeConfigFile(passwdPath) {
+			return
+		}
+		data, err := deploymentReadFileLimited(passwdPath, deploymentMaxFileSize)
 		if err != nil {
 			return
 		}
@@ -639,11 +636,7 @@ func deploymentUserName(uid int) string {
 		name = n
 	}
 	if name == "" {
-		if u, err := user.LookupId(strconv.Itoa(uid)); err == nil && u.Username != "" {
-			name = u.Username
-		}
-	}
-	if name == "" {
+		// 不调用 os/user/NSS，避免读取网络挂载的 /etc/passwd 或触发 NSS 阻塞
 		name = strconv.Itoa(uid)
 	}
 	// 限制缓存规模，避免异常 UID 空间导致内存持续增长
@@ -696,48 +689,6 @@ type deploymentInventorySource struct {
 	collect func(context.Context) ([]deploymentInventoryService, error)
 }
 
-// deploymentInventoryCommand 创建带超时和 WaitDelay 的外部命令。
-// WaitDelay 确保子进程被 context 取消后，即使有孙进程继承 stdout/stderr 管道，
-// Output() 也不会无限等待管道关闭。
-func deploymentInventoryCommand(ctx context.Context, timeout time.Duration, name string, args ...string) (*exec.Cmd, context.CancelFunc) {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	cmd := exec.CommandContext(cctx, name, args...)
-	cmd.WaitDelay = 2 * time.Second
-	return cmd, cancel
-}
-
-type deploymentLimitedBuffer struct {
-	buf   bytes.Buffer
-	limit int
-}
-
-func (b *deploymentLimitedBuffer) Write(p []byte) (int, error) {
-	remaining := b.limit - b.buf.Len()
-	if remaining > 0 {
-		if len(p) <= remaining {
-			_, _ = b.buf.Write(p)
-		} else {
-			_, _ = b.buf.Write(p[:remaining])
-		}
-	}
-	// 始终返回 len(p)，避免命令因短写异常退出；超出部分丢弃以限制内存
-	return len(p), nil
-}
-
-// deploymentInventoryCommandOutput 执行外部命令并限制 stdout/stderr 内存占用。
-func deploymentInventoryCommandOutput(ctx context.Context, timeout time.Duration, limit int64, name string, args ...string) ([]byte, error) {
-	cmd, cancel := deploymentInventoryCommand(ctx, timeout, name, args...)
-	defer cancel()
-	stdout := &deploymentLimitedBuffer{limit: int(limit)}
-	stderr := &deploymentLimitedBuffer{limit: 64 << 10}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s failed: %w: %s", name, err, strings.TrimSpace(stderr.buf.String()))
-	}
-	return stdout.buf.Bytes(), nil
-}
-
 // deploymentInventoryAcquireSource 获取数据源执行权；若上一轮同名数据源仍未返回，
 // 本轮直接跳过，避免卡死的数据源在每次刷新时不断堆积 goroutine。
 func deploymentInventoryAcquireSource(name string) (*atomic.Bool, bool) {
@@ -782,6 +733,9 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 	timeout := deploymentEnvDuration("DEPLOYMENT_INVENTORY_TIMEOUT", deploymentDefaultTimeout)
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
+
+	// 每次刷新重新读取挂载信息，避免配置目录后续变成 NFS/Ceph 后仍被访问
+	deploymentRefreshSelfMounts()
 
 	sources := deploymentInventorySources()
 	prev := deploymentInventorySnapshotPtr.Load()
@@ -915,6 +869,18 @@ func deploymentIsGenericRuntime(path string) bool {
 	return false
 }
 
+func deploymentIsNumericString(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // deploymentMergeServices 合并不同数据源的重复服务，并确保服务名唯一
 func deploymentMergeServices(input []deploymentInventoryService) []deploymentInventoryService {
 	if len(input) == 0 {
@@ -935,13 +901,20 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 			dst.Exe = "unknown"
 		}
 		if src.Cwd != "" && src.Cwd != "unknown" {
-			dst.Cwd = src.Cwd
+			// 配置类条目的 WorkingDirectory 优先于进程 PWD（PWD 可能过期）
+			if dst.Cwd == "" || dst.Cwd == "unknown" || src.Source != "process" {
+				dst.Cwd = src.Cwd
+			}
 		}
 		if src.Root != "" && src.Root != "unknown" {
 			dst.Root = src.Root
 		}
 		if src.User != "" && src.User != "unknown" {
-			dst.User = src.User
+			// 进程来源可能是纯数字 UID；配置中的用户名更友好时不被覆盖
+			if dst.User == "" || dst.User == "unknown" ||
+				!deploymentIsNumericString(src.User) || deploymentIsNumericString(dst.User) {
+				dst.User = src.User
+			}
 		}
 		if src.Status == "running" {
 			dst.Status = "running"
@@ -1189,17 +1162,19 @@ func deploymentSystemdUnitDirs() []deploymentUnitDir {
 		{path: "/usr/lib/systemd/system", custom: false},
 		{path: "/lib/systemd/system", custom: false},
 	}
-	seen := make(map[string]struct{})
-	var seenInfo []os.FileInfo
+	seenInfo := make([]os.FileInfo, 0, len(candidates))
 	out := make([]deploymentUnitDir, 0, len(candidates))
 	for _, c := range candidates {
 		full := deploymentHostPath(c.path)
-		info, err := os.Stat(full)
+		if deploymentIsPathOnNetworkFS(full) {
+			// 配置目录位于 NFS/Ceph 时直接跳过，避免 open/stat 卡在 D 状态
+			continue
+		}
+		// 使用 Lstat 不跟随软链，避免软链目标位于网络存储时触发阻塞
+		info, err := os.Lstat(full)
 		if err != nil || !info.IsDir() {
 			continue
 		}
-		// 通过 inode 去重，避免 /lib -> /usr/lib 等软链导致重复读取；
-		// 容器场景下不能对 /host/lib 做 EvalSymlinks（绝对软链会跳出 host root）。
 		duplicate := false
 		for _, existing := range seenInfo {
 			if os.SameFile(info, existing) {
@@ -1211,15 +1186,6 @@ func deploymentSystemdUnitDirs() []deploymentUnitDir {
 			continue
 		}
 		seenInfo = append(seenInfo, info)
-		// 记录真实路径仅用于非容器场景的去重标记
-		if deploymentHostRoot() == "" {
-			if real, err := filepath.EvalSymlinks(full); err == nil {
-				if _, ok := seen[real]; ok {
-					continue
-				}
-				seen[real] = struct{}{}
-			}
-		}
 		out = append(out, deploymentUnitDir{path: full, custom: c.custom})
 	}
 	return out
@@ -1241,7 +1207,11 @@ func deploymentSystemdEnabledUnits(dirs []deploymentUnitDir) map[string]bool {
 			if !strings.HasSuffix(name, ".wants") && !strings.HasSuffix(name, ".requires") {
 				continue
 			}
-			subEntries, err := os.ReadDir(filepath.Join(dir.path, name))
+			subDir := filepath.Join(dir.path, name)
+			if deploymentIsPathOnNetworkFS(subDir) {
+				continue
+			}
+			subEntries, err := os.ReadDir(subDir)
 			if err != nil {
 				continue
 			}
@@ -1251,31 +1221,6 @@ func deploymentSystemdEnabledUnits(dirs []deploymentUnitDir) map[string]bool {
 		}
 	}
 	return enabled
-}
-
-// deploymentSystemdRunningUnits 获取当前 running 的 systemd service（失败则返回空）
-func deploymentSystemdRunningUnits(ctx context.Context) (map[string]bool, bool) {
-	running := make(map[string]bool)
-	if deploymentHostRoot() != "" {
-		return running, false
-	}
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return running, false
-	}
-	out, err := deploymentInventoryCommandOutput(ctx, 5*time.Second, 4<<20, "systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--no-legend", "--plain")
-	if err != nil {
-		return running, false
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "●")))
-		if len(fields) == 0 {
-			continue
-		}
-		if strings.HasSuffix(fields[0], ".service") {
-			running[fields[0]] = true
-		}
-	}
-	return running, true
 }
 
 type deploymentUnitConfig struct {
@@ -1402,7 +1347,6 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 	}
 
 	enabled := deploymentSystemdEnabledUnits(dirs)
-	running, haveRunning := deploymentSystemdRunningUnits(ctx)
 
 	type unitFile struct {
 		name   string
@@ -1417,6 +1361,10 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 		}
 		for _, entry := range entries {
 			name := entry.Name()
+			if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+				// 不跟随软链，避免单元文件目标位于网络存储时 open 阻塞
+				continue
+			}
 			if !strings.HasSuffix(name, ".service") || strings.Contains(name, "@.") {
 				continue
 			}
@@ -1424,7 +1372,11 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 			if _, ok := unitMap[name]; ok {
 				continue
 			}
-			unitMap[name] = unitFile{name: name, path: filepath.Join(dir.path, name), custom: dir.custom}
+			path := filepath.Join(dir.path, name)
+			if deploymentIsPathOnNetworkFS(path) {
+				continue
+			}
+			unitMap[name] = unitFile{name: name, path: path, custom: dir.custom}
 		}
 	}
 
@@ -1450,7 +1402,7 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 				if ctx.Err() != nil {
 					return
 				}
-				svc, err := deploymentBuildSystemdService(unit.name, unit.path, unit.custom, enabled, running, haveRunning)
+				svc, err := deploymentBuildSystemdService(unit.name, unit.path, unit.custom, enabled)
 				select {
 				case results <- unitResult{svc: svc, err: err}:
 				case <-ctx.Done():
@@ -1493,7 +1445,7 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 	return services, nil
 }
 
-func deploymentBuildSystemdService(unitName, unitPath string, custom bool, enabled, running map[string]bool, haveRunning bool) (*deploymentInventoryService, error) {
+func deploymentBuildSystemdService(unitName, unitPath string, custom bool, enabled map[string]bool) (*deploymentInventoryService, error) {
 	name := strings.TrimSuffix(unitName, ".service")
 	if deploymentIsSystemService(name) {
 		return nil, nil
@@ -1505,15 +1457,15 @@ func deploymentBuildSystemdService(unitName, unitPath string, custom bool, enabl
 
 	middleware := deploymentDetectMiddleware(name, cfg.exec, "", "")
 	isEnabled := enabled[unitName]
-	isRunning := running[unitName]
 
 	// 非自定义单元中，系统工具类命令（mount/plymouth/ldconfig 等）不视为业务部署
 	if !custom && middleware == "none" && deploymentIsSystemExec(cfg.exec) {
 		return nil, nil
 	}
 
-	// 包管理安装的非中间件服务，仅保留 enabled/running 的，避免系统服务刷屏
-	if !custom && !isEnabled && !isRunning && middleware == "none" {
+	// 包管理安装的非中间件服务，仅保留 enabled 的，避免系统服务刷屏。
+	// 运行状态由进程 cgroup 合并补全，不再调用 systemctl。
+	if !custom && !isEnabled && middleware == "none" {
 		return nil, nil
 	}
 
@@ -1525,13 +1477,6 @@ func deploymentBuildSystemdService(unitName, unitPath string, custom bool, enabl
 	}
 
 	status := "unknown"
-	if haveRunning {
-		if isRunning {
-			status = "running"
-		} else {
-			status = "inactive"
-		}
-	}
 
 	path := cfg.exec
 	if path == "" {
@@ -1560,24 +1505,45 @@ func deploymentBuildSystemdService(unitName, unitPath string, custom bool, enabl
 
 func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, error) {
 	initDir := deploymentHostPath("/etc/init.d")
+	if deploymentIsPathOnNetworkFS(initDir) {
+		return nil, nil // 配置目录在 NFS/Ceph 上，直接跳过避免 open 阻塞
+	}
 	entries, err := os.ReadDir(initDir)
 	if err != nil {
 		return nil, nil // 目录不存在视为无数据，不报错
 	}
 
 	enabled := make(map[string]bool)
-	rcPatterns := []string{
-		"/etc/rc*.d/S*",
-		"/etc/rc.d/rc*.d/S*",
-		"/etc/init.d/rc*.d/S*", // SUSE
+	rcDirs := make([]string, 0, 24)
+	for i := 0; i <= 6; i++ {
+		rcDirs = append(rcDirs,
+			fmt.Sprintf("/etc/rc%d.d", i),
+			fmt.Sprintf("/etc/rc.d/rc%d.d", i),
+			fmt.Sprintf("/etc/init.d/rc%d.d", i),
+		)
 	}
-	for _, pattern := range rcPatterns {
-		matches, _ := filepath.Glob(deploymentHostPath(pattern))
-		for _, match := range matches {
-			base := filepath.Base(match)
-			name := strings.TrimLeft(base, "S0123456789")
-			if name != "" {
-				enabled[name] = true
+	rcDirs = append(rcDirs, "/etc/rcS.d", "/etc/rc.d/rcS.d", "/etc/init.d/rcS.d")
+	for _, rcDir := range rcDirs {
+		full := deploymentHostPath(rcDir)
+		if deploymentIsPathOnNetworkFS(full) {
+			continue
+		}
+		info, err := os.Lstat(full)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		entries, err := os.ReadDir(full)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasPrefix(name, "S") {
+				continue
+			}
+			service := strings.TrimLeft(name, "S0123456789")
+			if service != "" {
+				enabled[service] = true
 			}
 		}
 	}
@@ -1590,6 +1556,10 @@ func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, 
 		if entry.IsDir() {
 			continue
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			// 不跟随 init 脚本软链，避免目标位于网络存储时读取阻塞
+			continue
+		}
 		name := entry.Name()
 		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".dpkg-dist") ||
 			strings.HasSuffix(name, ".dpkg-old") || strings.HasSuffix(name, ".rpmnew") {
@@ -1599,8 +1569,7 @@ func deploymentCollectInitd(ctx context.Context) ([]deploymentInventoryService, 
 			continue
 		}
 		path := filepath.Join(initDir, name)
-		info, err := entry.Info()
-		if err != nil || info.Mode().IsDir() {
+		if deploymentIsPathOnNetworkFS(path) {
 			continue
 		}
 		middleware := deploymentDetectMiddleware(name, path, "", "")
@@ -1818,7 +1787,11 @@ func deploymentParseUpstartJob(path string) (*deploymentUpstartJob, error) {
 
 	// /etc/init/<job>.override 中的 manual 表示不自动启动
 	overridePath := strings.TrimSuffix(path, ".conf") + ".override"
-	if override, err := deploymentReadFileLimited(overridePath, deploymentMaxFileSize); err == nil {
+	if info, statErr := os.Lstat(overridePath); statErr == nil && info.Mode().IsRegular() {
+		override, err := deploymentReadFileLimited(overridePath, deploymentMaxFileSize)
+		if err != nil {
+			return job, nil
+		}
 		for _, line := range strings.Split(string(override), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") {
@@ -1874,75 +1847,33 @@ func deploymentParseUpstartScriptCommand(line string) string {
 	return ""
 }
 
-// deploymentUpstartStatus 通过 initctl list 获取 job 运行状态（老系统 initctl 在 /sbin）
-func deploymentUpstartStatus(ctx context.Context) (map[string]string, bool) {
-	status := make(map[string]string)
-	if deploymentHostRoot() != "" {
-		return status, false
-	}
-	bin := ""
-	for _, candidate := range []string{"initctl", "/sbin/initctl", "/usr/sbin/initctl"} {
-		if p, err := exec.LookPath(candidate); err == nil {
-			bin = p
-			break
-		}
-	}
-	if bin == "" {
-		return status, false
-	}
-	out, err := deploymentInventoryCommandOutput(ctx, 5*time.Second, 4<<20, bin, "list")
-	if err != nil {
-		return status, false
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		name := fields[0]
-		state := ""
-		for _, field := range fields[1:] {
-			if strings.Contains(field, "/") {
-				state = strings.TrimSuffix(field, ",")
-				break
-			}
-		}
-		if state == "" {
-			state = strings.TrimSuffix(fields[1], ",")
-		}
-		switch {
-		case strings.HasPrefix(state, "start/"):
-			status[name] = "running"
-		case strings.HasPrefix(state, "stop/"):
-			status[name] = "stopped"
-		default:
-			status[name] = strings.ToLower(state)
-		}
-	}
-	return status, true
-}
-
 func deploymentCollectUpstart(ctx context.Context) ([]deploymentInventoryService, error) {
 	initDir := deploymentHostPath("/etc/init")
+	if deploymentIsPathOnNetworkFS(initDir) {
+		return nil, nil // 配置目录在 NFS/Ceph 上，跳过避免 open 阻塞
+	}
 	entries, err := os.ReadDir(initDir)
 	if err != nil {
 		return nil, nil // 非 Upstart 系统视为无数据
 	}
-	statusMap, statusKnown := deploymentUpstartStatus(ctx)
 
 	var services []deploymentInventoryService
 	for _, entry := range entries {
 		if ctx.Err() != nil {
 			return services, ctx.Err()
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(entry.Name(), ".conf") {
 			continue
 		}
 		jobName := strings.TrimSuffix(entry.Name(), ".conf")
 		if deploymentIsSystemService(jobName) {
 			continue
 		}
-		job, err := deploymentParseUpstartJob(filepath.Join(initDir, entry.Name()))
+		path := filepath.Join(initDir, entry.Name())
+		if deploymentIsPathOnNetworkFS(path) {
+			continue
+		}
+		job, err := deploymentParseUpstartJob(path)
 		if err != nil || job == nil {
 			continue
 		}
@@ -1962,13 +1893,8 @@ func deploymentCollectUpstart(ctx context.Context) ([]deploymentInventoryService
 		}
 
 		status := "unknown"
-		if state, ok := statusMap[jobName]; ok {
-			status = state
-		} else if statusKnown {
-			status = "stopped"
-		}
 
-		path := job.exec
+		path = job.exec
 		if path == "" {
 			path = filepath.Join(initDir, entry.Name())
 		}
@@ -2013,9 +1939,19 @@ func deploymentSupervisorConfigFiles() []string {
 	seen := make(map[string]struct{})
 	var files []string
 	for _, candidate := range candidates {
+		if strings.ContainsAny(candidate, "*?[") {
+			// 先确认 glob 目录本身不是网络挂载，避免 ReadDir 卡在 D 状态
+			dir := filepath.Dir(deploymentHostPath(candidate))
+			if deploymentIsPathOnNetworkFS(dir) {
+				continue
+			}
+		}
 		matches, _ := filepath.Glob(deploymentHostPath(candidate))
 		for _, match := range matches {
 			if _, ok := seen[match]; ok {
+				continue
+			}
+			if !deploymentSafeConfigFile(match) {
 				continue
 			}
 			seen[match] = struct{}{}
@@ -2045,16 +1981,21 @@ func deploymentCollectSupervisor(ctx context.Context) ([]deploymentInventoryServ
 			if !filepath.IsAbs(include) {
 				include = filepath.Join(filepath.Dir(path), include)
 			}
-			matches, _ := filepath.Glob(deploymentHostPath(strings.TrimPrefix(include, deploymentHostRoot())))
+			pattern := deploymentHostPath(strings.TrimPrefix(include, deploymentHostRoot()))
+			if deploymentIsPathOnNetworkFS(filepath.Dir(pattern)) {
+				continue
+			}
+			matches, _ := filepath.Glob(pattern)
 			for _, match := range matches {
+				if !deploymentSafeConfigFile(match) {
+					continue
+				}
 				if _, ok := seen[match]; !ok {
 					queue = append(queue, match)
 				}
 			}
 		}
 	}
-
-	statusMap := deploymentSupervisorStatus(ctx)
 
 	type programConfig = deploymentSupervisorProgram
 	var programs []programConfig
@@ -2088,9 +2029,6 @@ func deploymentCollectSupervisor(ctx context.Context) ([]deploymentInventoryServ
 			enabled = "false"
 		}
 		status := "unknown"
-		if state, ok := statusMap[p.name]; ok {
-			status = state
-		}
 		services = append(services, deploymentInventoryService{
 			Name:        p.name,
 			Path:        exe,
@@ -2205,34 +2143,6 @@ func deploymentParseSupervisorPrograms(path string) ([]deploymentSupervisorProgr
 	return programs, scanner.Err()
 }
 
-func deploymentSupervisorStatus(ctx context.Context) map[string]string {
-	status := make(map[string]string)
-	if deploymentHostRoot() != "" {
-		return status
-	}
-	if _, err := exec.LookPath("supervisorctl"); err != nil {
-		return status
-	}
-	out, err := deploymentInventoryCommandOutput(ctx, 5*time.Second, 4<<20, "supervisorctl", "status")
-	if err != nil {
-		return status
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		state := strings.ToLower(fields[1])
-		switch state {
-		case "running":
-			status[fields[0]] = "running"
-		case "stopped", "exited", "fatal", "backoff", "starting", "stopping":
-			status[fields[0]] = state
-		}
-	}
-	return status
-}
-
 // ==========================================================================
 // 数据源：进程
 // ==========================================================================
@@ -2252,19 +2162,6 @@ type deploymentProcessInfo struct {
 	container string
 }
 
-// deploymentProcLinkMode 返回 /proc/<pid>/{exe,cwd,root} 读取策略：
-// all=全部读取；none=不读取；auto=发现 NFS/Ceph 等网络文件系统时跳过（默认）。
-func deploymentProcLinkMode() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_PROC_LINKS"))) {
-	case "all":
-		return "all"
-	case "none":
-		return "none"
-	default:
-		return "auto"
-	}
-}
-
 var deploymentNetworkFSTypes = map[string]struct{}{
 	"nfs": {}, "nfs4": {}, "ceph": {}, "cephfs": {},
 	"cifs": {}, "smb3": {}, "glusterfs": {}, "lustre": {},
@@ -2278,50 +2175,116 @@ var deploymentNetworkFSTypes = map[string]struct{}{
 }
 
 // deploymentIsNetworkFSType 判断挂载类型是否可能因网络存储挂死
+// deploymentMountInfo 本进程可见的挂载点与文件系统类型
+type deploymentMountInfo struct {
+	point  string
+	fstype string
+}
+
+var deploymentSelfMountsPtr atomic.Pointer[[]deploymentMountInfo]
+
+// deploymentRefreshSelfMounts 每次刷新前读取 /proc/self/mountinfo（procfs 读取，不触碰业务存储）。
+// 使用原子快照，配置数据源并发读取时不需要加锁。
+func deploymentRefreshSelfMounts() {
+	data, err := deploymentReadFileLimited("/proc/self/mountinfo", 2<<20)
+	if err != nil {
+		return
+	}
+	mounts := make([]deploymentMountInfo, 0, 64)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		point := deploymentUnescapeMountPath(fields[4])
+		separator := -1
+		for i := 5; i < len(fields); i++ {
+			if fields[i] == "-" {
+				separator = i
+				break
+			}
+		}
+		if separator < 0 || separator+1 >= len(fields) {
+			continue
+		}
+		mounts = append(mounts, deploymentMountInfo{
+			point:  filepath.Clean(point),
+			fstype: fields[separator+1],
+		})
+	}
+	deploymentSelfMountsPtr.Store(&mounts)
+}
+
+func deploymentLoadSelfMounts() []deploymentMountInfo {
+	if mounts := deploymentSelfMountsPtr.Load(); mounts != nil {
+		return *mounts
+	}
+	deploymentRefreshSelfMounts()
+	if mounts := deploymentSelfMountsPtr.Load(); mounts != nil {
+		return *mounts
+	}
+	return nil
+}
+
+var deploymentMountPathReplacer = strings.NewReplacer(
+	`\040`, " ",
+	`\011`, "\t",
+	`\012`, "\n",
+	`\134`, `\`,
+)
+
+func deploymentUnescapeMountPath(path string) string {
+	return deploymentMountPathReplacer.Replace(path)
+}
+
+// deploymentIsPathOnNetworkFS 使用 mountinfo 判断路径是否位于网络文件系统。
+// 只读 procfs，不 stat/open 目标路径，避免挂载点失联时进入 D 状态。
+func deploymentIsPathOnNetworkFS(path string) bool {
+	path = filepath.Clean(path)
+	mounts := deploymentLoadSelfMounts()
+	if len(mounts) == 0 {
+		// 无法确认挂载类型时按不安全处理，绝不冒险 open/stat 未知路径
+		return true
+	}
+	bestLen := -1
+	network := false
+	for _, mount := range mounts {
+		if mount.point != "/" && path != mount.point && !strings.HasPrefix(path, mount.point+"/") {
+			continue
+		}
+		if len(mount.point) > bestLen {
+			bestLen = len(mount.point)
+			network = deploymentIsUnsafePathFSType(mount.fstype)
+		}
+	}
+	return network
+}
+
 func deploymentIsNetworkFSType(fstype string) bool {
 	_, ok := deploymentNetworkFSTypes[strings.ToLower(strings.TrimSpace(fstype))]
 	return ok
 }
 
-// deploymentProcessHasNetworkFS 检查进程 mount namespace 是否包含网络文件系统
-func deploymentProcessHasNetworkFS(procRoot string, pid int) bool {
-	base := filepath.Join(procRoot, strconv.Itoa(pid))
-	nsID := ""
-	if link, err := os.Readlink(filepath.Join(base, "ns", "mnt")); err == nil {
-		nsID = link
-		if cached, ok := deploymentNetworkFSCache.Load(nsID); ok {
-			return cached.(bool)
-		}
+// deploymentIsUnsafePathFSType 配置路径安全判断：网络 FS、FUSE、autofs、virtiofs
+// 都可能在访问时触发远端/用户态服务阻塞，因此配置目录遇到这些类型直接跳过。
+func deploymentIsUnsafePathFSType(fstype string) bool {
+	lower := strings.ToLower(strings.TrimSpace(fstype))
+	if deploymentIsNetworkFSType(lower) {
+		return true
 	}
+	return strings.HasPrefix(lower, "fuse") || lower == "autofs" || lower == "virtiofs"
+}
 
-	data, err := deploymentReadFileLimited(filepath.Join(base, "mountinfo"), 512*1024)
-	if err != nil {
+// deploymentSafeConfigFile 判断配置路径是否为本地普通文件（不跟随软链）。
+func deploymentSafeConfigFile(path string) bool {
+	if deploymentIsPathOnNetworkFS(path) {
 		return false
 	}
-	hasNetworkFS := false
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		separator := -1
-		for i, field := range fields {
-			if field == "-" {
-				separator = i
-				break
-			}
-		}
-		if separator >= 0 && separator+1 < len(fields) && deploymentIsNetworkFSType(fields[separator+1]) {
-			hasNetworkFS = true
-			break
-		}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
 	}
-
-	// 缓存同一 mount namespace 的结果，避免每个进程重复解析数百 KB 的 mountinfo。
-	// 限制缓存条目数，防止异常环境创建大量 namespace 导致内存增长。
-	if nsID != "" && deploymentNetworkFSCacheCount.Load() < 4096 {
-		if _, loaded := deploymentNetworkFSCache.LoadOrStore(nsID, hasNetworkFS); !loaded {
-			deploymentNetworkFSCacheCount.Add(1)
-		}
-	}
-	return hasNetworkFS
+	return true
 }
 
 func deploymentExeFromCmdline(cmdline string) string {
@@ -2336,12 +2299,13 @@ func deploymentExeFromCmdline(cmdline string) string {
 	return ""
 }
 
-func deploymentReadProcess(procRoot string, pid int, skipContainer bool, linkMode string) (*deploymentProcessInfo, bool) {
+func deploymentReadProcess(procRoot string, pid int, skipContainer bool) (*deploymentProcessInfo, bool) {
 	base := filepath.Join(procRoot, strconv.Itoa(pid))
-	info := &deploymentProcessInfo{pid: pid}
+	info := &deploymentProcessInfo{pid: pid, root: "unknown"}
 
-	// 先读 cgroup：容器内进程默认在读取 comm/cmdline/mountinfo/readlink 之前就跳过，
-	// 避免 Kubernetes/Docker 节点上成千上万个容器进程造成额外 I/O 和卡死风险。
+	// 只读取 procfs 内存文件，不读取 /proc/<pid>/{exe,cwd,root} 链接，
+	// 避免 readlink 进入 NFS/Ceph 等业务存储后卡在 D 状态。
+	// cgroup 最先读取，容器内进程直接跳过。
 	if data, err := deploymentReadFileLimited(filepath.Join(base, "cgroup"), 64*1024); err == nil {
 		info.cgroup = string(data)
 		info.unit, info.container = deploymentParseCgroup(string(data))
@@ -2355,33 +2319,12 @@ func deploymentReadProcess(procRoot string, pid int, skipContainer bool, linkMod
 	}
 	if data, err := deploymentReadFileLimited(filepath.Join(base, "cmdline"), 64*1024); err == nil {
 		info.cmdline = strings.TrimSpace(strings.ReplaceAll(string(data), "\x00", " "))
-	}
-
-	// 默认 auto：进程挂载了 NFS/Ceph 等网络文件系统时，不读取 exe/cwd/root 链接，
-	// 避免 readlink 进入挂死的网络存储导致采集线程卡在 D 状态。
-	linksAllowed := true
-	switch linkMode {
-	case "none":
-		linksAllowed = false
-	case "all":
-		linksAllowed = true
-	default:
-		linksAllowed = !deploymentProcessHasNetworkFS(procRoot, pid)
-	}
-	if linksAllowed {
-		if link, err := os.Readlink(filepath.Join(base, "exe")); err == nil {
-			info.exe = deploymentCleanProcPath(link)
-		}
-		if link, err := os.Readlink(filepath.Join(base, "cwd")); err == nil {
-			info.cwd = deploymentCleanProcPath(link)
-		}
-		if link, err := os.Readlink(filepath.Join(base, "root")); err == nil {
-			info.root = deploymentCleanProcPath(link)
-		}
-	}
-	if info.exe == "" {
-		// 跳过 readlink 时仍可从 cmdline 获取可执行文件路径（只读 /proc，不触碰业务存储）
+		// 可执行文件路径从 cmdline[0] 获取（纯 procfs 读取，不触碰业务存储）
 		info.exe = deploymentExeFromCmdline(info.cmdline)
+	}
+	if data, err := deploymentReadFileLimited(filepath.Join(base, "environ"), 64*1024); err == nil {
+		// 工作目录从环境变量 PWD 获取；PWD 可能缺失或过期，但不产生任何 readlink。
+		info.cwd = deploymentPwdFromEnviron(data)
 	}
 	if data, err := deploymentReadFileLimited(filepath.Join(base, "status"), 64*1024); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
@@ -2406,6 +2349,20 @@ func deploymentReadProcess(procRoot string, pid int, skipContainer bool, linkMod
 	}
 	info.user = deploymentUserName(info.uid)
 	return info, true
+}
+
+func deploymentPwdFromEnviron(data []byte) string {
+	for _, entry := range strings.Split(string(data), "\x00") {
+		const prefix = "PWD="
+		if !strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		pwd := strings.TrimPrefix(entry, prefix)
+		if strings.HasPrefix(pwd, "/") && !strings.ContainsAny(pwd, "\x00\x01\r\n") {
+			return deploymentCleanProcPath(pwd)
+		}
+	}
+	return ""
 }
 
 // deploymentParseCgroup 解析 cgroup，返回 systemd service 单元和容器标识
@@ -2467,12 +2424,7 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 	}
 	defer procDir.Close()
 
-	// 每次扫描重建 mount namespace 缓存，避免业务后续挂载 NFS/Ceph 后仍使用旧的 false 结果。
-	deploymentNetworkFSCache.Clear()
-	deploymentNetworkFSCacheCount.Store(0)
-
 	skipContainer := deploymentShouldSkipContainerProcess()
-	linkMode := deploymentProcLinkMode()
 	concurrency := deploymentInventoryConcurrency()
 	jobs := make(chan int, concurrency*2)
 	var closeOnce sync.Once
@@ -2503,7 +2455,7 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 				if ctx.Err() != nil {
 					return
 				}
-				info, ok := deploymentReadProcess(procRoot, pid, skipContainer, linkMode)
+				info, ok := deploymentReadProcess(procRoot, pid, skipContainer)
 				if !ok || info == nil {
 					continue
 				}
