@@ -3,10 +3,10 @@
 // 本文件实现「主机部署清单采集器」（deployment_inventory）。
 //
 // 设计目标：
-//  1. 采集主机上已安装/已部署的服务、中间件、容器、定时任务清单；
+//  1. 采集主机上已安装/已部署的服务与中间件清单；
 //  2. 采集字段包含：服务名、服务路径、运行用户、启动方式、中间件类型、
 //     工作目录(cwd)、可执行文件(exe)、根目录(root) 等；
-//  3. 默认排除操作系统自带服务与内核线程，只保留业务部署与中间件；
+//  3. 默认排除操作系统自带服务、内核线程与容器进程，只保留业务部署与中间件；
 //  4. 全异步刷新：Collect() 只读取内存快照，绝不阻塞 /metrics；
 //  5. 默认每 24 小时刷新一次，首次启动立即在后台刷新；
 //  6. 所有外部命令带超时，进程扫描使用固定大小工作池，避免高并发/死锁；
@@ -15,6 +15,7 @@ package my_collectors
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -46,6 +47,8 @@ const (
 	deploymentMaxFileSize = 1 << 20
 	// deploymentDefaultCacheTTL 数据源刷新失败时旧缓存默认保留时间
 	deploymentDefaultCacheTTL = 24 * time.Hour
+	// deploymentCmdlineScanLimit 命令行匹配时只扫描首尾 8 KiB，避免超长命令行拖慢采集
+	deploymentCmdlineScanLimit = 8 * 1024
 )
 
 // deploymentInventoryService 单条服务/中间件部署信息
@@ -96,7 +99,18 @@ var (
 	deploymentInventoryHostUsersMap  map[int]string
 
 	// deploymentInventoryUserCache 缓存 UID -> 用户名，避免重复 NSS 查询
-	deploymentInventoryUserCache sync.Map
+	deploymentInventoryUserCache      sync.Map
+	deploymentInventoryUserCacheCount atomic.Int64
+
+	// deploymentNetworkFSCache 缓存 mount namespace -> 是否包含网络文件系统
+	deploymentNetworkFSCache      sync.Map
+	deploymentNetworkFSCacheCount atomic.Int64
+
+	// 额外包含/排除项解析一次，避免每个进程/单元重复 split+分配
+	deploymentExtraExcludesOnce sync.Once
+	deploymentExtraExcludesList []string
+	deploymentExtraIncludesOnce sync.Once
+	deploymentExtraIncludesList []string
 )
 
 // ==========================================================================
@@ -342,8 +356,8 @@ var deploymentInteractiveNames = map[string]struct{}{
 }
 
 // deploymentExtraExcludes 解析 DEPLOYMENT_INVENTORY_EXCLUDE（逗号分隔，子串匹配）
-func deploymentExtraExcludes() []string {
-	raw := strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_EXCLUDE"))
+func deploymentParseEnvList(name string) []string {
+	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
 		return nil
 	}
@@ -358,21 +372,19 @@ func deploymentExtraExcludes() []string {
 	return out
 }
 
+func deploymentExtraExcludes() []string {
+	deploymentExtraExcludesOnce.Do(func() {
+		deploymentExtraExcludesList = deploymentParseEnvList("DEPLOYMENT_INVENTORY_EXCLUDE")
+	})
+	return deploymentExtraExcludesList
+}
+
 // deploymentExtraIncludes 解析 DEPLOYMENT_INVENTORY_INCLUDE（逗号分隔，子串匹配，优先级高于排除规则）
 func deploymentExtraIncludes() []string {
-	raw := strings.TrimSpace(os.Getenv("DEPLOYMENT_INVENTORY_INCLUDE"))
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.ToLower(strings.TrimSpace(p))
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+	deploymentExtraIncludesOnce.Do(func() {
+		deploymentExtraIncludesList = deploymentParseEnvList("DEPLOYMENT_INVENTORY_INCLUDE")
+	})
+	return deploymentExtraIncludesList
 }
 
 // deploymentTruncateLabel 按字符数截断标签值，防止超长路径/命令行造成指标膨胀
@@ -447,27 +459,30 @@ func deploymentIsInteractiveProcess(name string) bool {
 	return false
 }
 
+var deploymentToolingPrefixes = []string{
+	"code-server", "code-", "vscode", "opencode", "copilot", "codex",
+	"ptyserver", "ptyhost", "extensionhost", "tsserver", "gopls",
+	"rust-analyzer", "clangd", "pyright", "jedi-language", "gcr-ssh",
+	"mpris", "ssh-agent", "wireplumber", "obex", "dconf", "gvfs",
+}
+
+var deploymentToolingPathMarkers = []string{
+	"/.vscode-server/", "/.vscode/", "/.cursor-server/", "/.cursor/",
+	"/.opencode/", "/.codex/", "/.cache/", "/.npm/", "/.nvm/",
+	"/.config/nvm/", "/.local/lib/", "/node_modules/", "/.local/share/",
+}
+
 // deploymentIsToolingProcess 判断是否开发工具/编辑器/桌面辅助进程（默认不纳入部署清单）
 func deploymentIsToolingProcess(name, exe, cmdline string) bool {
 	lowerName := strings.ToLower(name)
-	toolPrefixes := []string{
-		"code-server", "code-", "vscode", "opencode", "copilot", "codex",
-		"ptyserver", "ptyhost", "extensionhost", "tsserver", "gopls",
-		"rust-analyzer", "clangd", "pyright", "jedi-language", "gcr-ssh",
-		"mpris", "ssh-agent", "wireplumber", "obex", "dconf", "gvfs",
-	}
-	for _, p := range toolPrefixes {
+	for _, p := range deploymentToolingPrefixes {
 		if strings.HasPrefix(lowerName, p) {
 			return true
 		}
 	}
-	for _, text := range []string{exe, cmdline} {
+	for _, text := range []string{exe, deploymentCommandTextForScan(cmdline)} {
 		lower := strings.ToLower(text)
-		for _, marker := range []string{
-			"/.vscode-server/", "/.vscode/", "/.cursor-server/", "/.cursor/",
-			"/.opencode/", "/.codex/", "/.cache/", "/.npm/", "/.nvm/",
-			"/.config/nvm/", "/.local/lib/", "/node_modules/", "/.local/share/",
-		} {
+		for _, marker := range deploymentToolingPathMarkers {
 			if strings.Contains(lower, marker) {
 				return true
 			}
@@ -532,8 +547,18 @@ var deploymentMiddlewareAliases = map[string]string{
 	"hadoop": "hadoop", "spark": "spark", "sentinel": "sentinel", "seata": "seata",
 }
 
+// deploymentCommandTextForScan 截取命令行的首尾片段用于匹配，避免超长 cmdline 造成大字符串分配。
+func deploymentCommandTextForScan(text string) string {
+	if len(text) <= deploymentCmdlineScanLimit {
+		return text
+	}
+	half := deploymentCmdlineScanLimit / 2
+	return text[:half] + " " + text[len(text)-half:]
+}
+
 // deploymentDetectMiddleware 从名称、路径、命令行、镜像名中识别中间件
 func deploymentDetectMiddleware(name, path, cmdline, image string) string {
+	cmdline = deploymentCommandTextForScan(cmdline)
 	texts := []string{name, path, cmdline, image}
 	for _, text := range texts {
 		lower := strings.ToLower(text)
@@ -621,7 +646,12 @@ func deploymentUserName(uid int) string {
 	if name == "" {
 		name = strconv.Itoa(uid)
 	}
-	deploymentInventoryUserCache.Store(uid, name)
+	// 限制缓存规模，避免异常 UID 空间导致内存持续增长
+	if deploymentInventoryUserCacheCount.Load() < 8192 {
+		if _, loaded := deploymentInventoryUserCache.LoadOrStore(uid, name); !loaded {
+			deploymentInventoryUserCacheCount.Add(1)
+		}
+	}
 	return name
 }
 
@@ -676,6 +706,38 @@ func deploymentInventoryCommand(ctx context.Context, timeout time.Duration, name
 	return cmd, cancel
 }
 
+type deploymentLimitedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *deploymentLimitedBuffer) Write(p []byte) (int, error) {
+	remaining := b.limit - b.buf.Len()
+	if remaining > 0 {
+		if len(p) <= remaining {
+			_, _ = b.buf.Write(p)
+		} else {
+			_, _ = b.buf.Write(p[:remaining])
+		}
+	}
+	// 始终返回 len(p)，避免命令因短写异常退出；超出部分丢弃以限制内存
+	return len(p), nil
+}
+
+// deploymentInventoryCommandOutput 执行外部命令并限制 stdout/stderr 内存占用。
+func deploymentInventoryCommandOutput(ctx context.Context, timeout time.Duration, limit int64, name string, args ...string) ([]byte, error) {
+	cmd, cancel := deploymentInventoryCommand(ctx, timeout, name, args...)
+	defer cancel()
+	stdout := &deploymentLimitedBuffer{limit: int(limit)}
+	stderr := &deploymentLimitedBuffer{limit: 64 << 10}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%s failed: %w: %s", name, err, strings.TrimSpace(stderr.buf.String()))
+	}
+	return stdout.buf.Bytes(), nil
+}
+
 // deploymentInventoryAcquireSource 获取数据源执行权；若上一轮同名数据源仍未返回，
 // 本轮直接跳过，避免卡死的数据源在每次刷新时不断堆积 goroutine。
 func deploymentInventoryAcquireSource(name string) (*atomic.Bool, bool) {
@@ -727,7 +789,7 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 	results := make(map[string]deploymentInventorySourceResult, len(sources))
 	resultCh := make(chan deploymentInventorySourceResult, len(sources))
 
-	var wg sync.WaitGroup
+	launched := 0
 	for _, src := range sources {
 		flag, ok := deploymentInventoryAcquireSource(src.name)
 		if !ok {
@@ -740,9 +802,8 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 			log.Printf("[deployment_inventory] source %s is still running from previous refresh, skip this round", src.name)
 			continue
 		}
-		wg.Add(1)
+		launched++
 		go func(s deploymentInventorySource, running *atomic.Bool) {
-			defer wg.Done()
 			defer running.Store(false)
 			res := deploymentInventorySourceResult{name: s.name}
 			// 无论是否 panic 都必须回传结果，避免刷新流程等待不到该数据源
@@ -756,27 +817,19 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 		}(src, flag)
 	}
 
-	// 所有数据源并发执行；全部结束后关闭 channel
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
-
 	hardTimer := time.NewTimer(timeout + deploymentHardExtraTimeout)
 	defer hardTimer.Stop()
 
-collectLoop:
-	for {
+	// 每个成功启动的数据源只会发送一次结果，因此不需要额外的 wg.Wait/close
+	// goroutine（数据源永久卡住时那个 goroutine 也会泄漏）。读满 launched 条即可。
+	for i := 0; i < launched; i++ {
 		select {
-		case res, ok := <-resultCh:
-			if !ok {
-				break collectLoop
-			}
+		case res := <-resultCh:
 			results[res.name] = res
 		case <-hardTimer.C:
 			// 极端情况下（第三方命令不响应）不再等待，使用已有结果
 			log.Printf("[deployment_inventory] refresh hard timeout after %s, use partial results", timeout+deploymentHardExtraTimeout)
-			break collectLoop
+			i = launched // 退出循环
 		}
 	}
 
@@ -805,7 +858,9 @@ collectLoop:
 		if !ok || res.err != nil {
 			sourceUp[src.name] = 0
 			errCount++
-			if res.err != nil {
+			if !ok {
+				errMsgs = append(errMsgs, fmt.Sprintf("%s: no result (timeout or still running)", src.name))
+			} else if res.err != nil {
 				errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", src.name, res.err))
 			}
 
@@ -1049,7 +1104,16 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 		if out[i].Name != out[j].Name {
 			return out[i].Name < out[j].Name
 		}
-		return out[i].Exe < out[j].Exe
+		if out[i].Exe != out[j].Exe {
+			return out[i].Exe < out[j].Exe
+		}
+		if out[i].User != out[j].User {
+			return out[i].User < out[j].User
+		}
+		if out[i].Cwd != out[j].Cwd {
+			return out[i].Cwd < out[j].Cwd
+		}
+		return out[i].Path < out[j].Path
 	})
 
 	// 按服务身份去重：同名服务只保留一条，后续条目合并字段。
@@ -1096,7 +1160,13 @@ func deploymentMergeServices(input []deploymentInventoryService) []deploymentInv
 		if out[i].StartupType != out[j].StartupType {
 			return out[i].StartupType < out[j].StartupType
 		}
-		return out[i].Exe < out[j].Exe
+		if out[i].Exe != out[j].Exe {
+			return out[i].Exe < out[j].Exe
+		}
+		if out[i].User != out[j].User {
+			return out[i].User < out[j].User
+		}
+		return out[i].Cwd < out[j].Cwd
 	})
 
 	return out
@@ -1192,9 +1262,7 @@ func deploymentSystemdRunningUnits(ctx context.Context) (map[string]bool, bool) 
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return running, false
 	}
-	cmd, cancel := deploymentInventoryCommand(ctx, 5*time.Second, "systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--no-legend", "--plain")
-	defer cancel()
-	out, err := cmd.Output()
+	out, err := deploymentInventoryCommandOutput(ctx, 5*time.Second, 4<<20, "systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--no-legend", "--plain")
 	if err != nil {
 		return running, false
 	}
@@ -1373,18 +1441,32 @@ func deploymentCollectSystemd(ctx context.Context) ([]deploymentInventoryService
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[deployment_inventory] systemd worker panic recovered: %v", r)
+				}
+			}()
 			for unit := range jobs {
 				if ctx.Err() != nil {
 					return
 				}
 				svc, err := deploymentBuildSystemdService(unit.name, unit.path, unit.custom, enabled, running, haveRunning)
-				results <- unitResult{svc: svc, err: err}
+				select {
+				case results <- unitResult{svc: svc, err: err}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 	}
 
 	go func() {
 		defer close(jobs)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[deployment_inventory] systemd sender panic recovered: %v", r)
+			}
+		}()
 		for _, unit := range unitMap {
 			select {
 			case jobs <- unit:
@@ -1808,9 +1890,7 @@ func deploymentUpstartStatus(ctx context.Context) (map[string]string, bool) {
 	if bin == "" {
 		return status, false
 	}
-	cmd, cancel := deploymentInventoryCommand(ctx, 5*time.Second, bin, "list")
-	defer cancel()
-	out, err := cmd.Output()
+	out, err := deploymentInventoryCommandOutput(ctx, 5*time.Second, 4<<20, bin, "list")
 	if err != nil {
 		return status, false
 	}
@@ -1911,6 +1991,9 @@ func deploymentCollectUpstart(ctx context.Context) ([]deploymentInventoryService
 			dedupKey:    "upstart:" + jobName,
 			instances:   0,
 		})
+	}
+	if err := ctx.Err(); err != nil {
+		return services, err
 	}
 	return services, nil
 }
@@ -2130,9 +2213,7 @@ func deploymentSupervisorStatus(ctx context.Context) map[string]string {
 	if _, err := exec.LookPath("supervisorctl"); err != nil {
 		return status
 	}
-	cmd, cancel := deploymentInventoryCommand(ctx, 5*time.Second, "supervisorctl", "status")
-	defer cancel()
-	out, err := cmd.Output()
+	out, err := deploymentInventoryCommandOutput(ctx, 5*time.Second, 4<<20, "supervisorctl", "status")
 	if err != nil {
 		return status
 	}
@@ -2184,28 +2265,40 @@ func deploymentProcLinkMode() string {
 	}
 }
 
+var deploymentNetworkFSTypes = map[string]struct{}{
+	"nfs": {}, "nfs4": {}, "ceph": {}, "cephfs": {},
+	"cifs": {}, "smb3": {}, "glusterfs": {}, "lustre": {},
+	"9p": {}, "afs": {}, "davfs": {}, "davfs2": {}, "ncpfs": {},
+	"gpfs": {}, "beegfs": {}, "juicefs": {}, "alluxio": {},
+	"cvmfs": {}, "s3fs": {}, "ocfs2": {}, "gfs2": {},
+	"fuse.sshfs": {}, "fuse.s3fs": {}, "fuse.ceph": {},
+	"fuse.glusterfs": {}, "fuse.juicefs": {}, "fuse.alluxio": {},
+	"fuse.gcsfuse": {}, "fuse.rclone": {}, "fuse.curlftpfs": {},
+	"fuse.davfs2": {}, "fuse.s3ql": {},
+}
+
 // deploymentIsNetworkFSType 判断挂载类型是否可能因网络存储挂死
 func deploymentIsNetworkFSType(fstype string) bool {
-	lower := strings.ToLower(strings.TrimSpace(fstype))
-	for _, needle := range []string{
-		"nfs", "ceph", "cifs", "smb", "gluster", "fuse", "lustre", "9p",
-		"afs", "davfs", "ncpfs", "gpfs", "beegfs", "juicefs", "alluxio",
-		"cvmfs", "s3fs", "ocfs2", "gfs2",
-	} {
-		if strings.Contains(lower, needle) {
-			return true
-		}
-	}
-	return false
+	_, ok := deploymentNetworkFSTypes[strings.ToLower(strings.TrimSpace(fstype))]
+	return ok
 }
 
 // deploymentProcessHasNetworkFS 检查进程 mount namespace 是否包含网络文件系统
 func deploymentProcessHasNetworkFS(procRoot string, pid int) bool {
-	path := filepath.Join(procRoot, strconv.Itoa(pid), "mountinfo")
-	data, err := deploymentReadFileLimited(path, 512*1024)
+	base := filepath.Join(procRoot, strconv.Itoa(pid))
+	nsID := ""
+	if link, err := os.Readlink(filepath.Join(base, "ns", "mnt")); err == nil {
+		nsID = link
+		if cached, ok := deploymentNetworkFSCache.Load(nsID); ok {
+			return cached.(bool)
+		}
+	}
+
+	data, err := deploymentReadFileLimited(filepath.Join(base, "mountinfo"), 512*1024)
 	if err != nil {
 		return false
 	}
+	hasNetworkFS := false
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		separator := -1
@@ -2216,10 +2309,19 @@ func deploymentProcessHasNetworkFS(procRoot string, pid int) bool {
 			}
 		}
 		if separator >= 0 && separator+1 < len(fields) && deploymentIsNetworkFSType(fields[separator+1]) {
-			return true
+			hasNetworkFS = true
+			break
 		}
 	}
-	return false
+
+	// 缓存同一 mount namespace 的结果，避免每个进程重复解析数百 KB 的 mountinfo。
+	// 限制缓存条目数，防止异常环境创建大量 namespace 导致内存增长。
+	if nsID != "" && deploymentNetworkFSCacheCount.Load() < 4096 {
+		if _, loaded := deploymentNetworkFSCache.LoadOrStore(nsID, hasNetworkFS); !loaded {
+			deploymentNetworkFSCacheCount.Add(1)
+		}
+	}
+	return hasNetworkFS
 }
 
 func deploymentExeFromCmdline(cmdline string) string {
@@ -2234,7 +2336,7 @@ func deploymentExeFromCmdline(cmdline string) string {
 	return ""
 }
 
-func deploymentReadProcess(procRoot string, pid int, skipContainer bool) (*deploymentProcessInfo, bool) {
+func deploymentReadProcess(procRoot string, pid int, skipContainer bool, linkMode string) (*deploymentProcessInfo, bool) {
 	base := filepath.Join(procRoot, strconv.Itoa(pid))
 	info := &deploymentProcessInfo{pid: pid}
 
@@ -2258,7 +2360,7 @@ func deploymentReadProcess(procRoot string, pid int, skipContainer bool) (*deplo
 	// 默认 auto：进程挂载了 NFS/Ceph 等网络文件系统时，不读取 exe/cwd/root 链接，
 	// 避免 readlink 进入挂死的网络存储导致采集线程卡在 D 状态。
 	linksAllowed := true
-	switch deploymentProcLinkMode() {
+	switch linkMode {
 	case "none":
 		linksAllowed = false
 	case "all":
@@ -2359,39 +2461,49 @@ func deploymentShouldSkipContainerProcess() bool {
 // deploymentCollectProcesses 并发扫描 /proc，构建进程级部署清单
 func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryService, error) {
 	procRoot := deploymentProcRoot()
-	entries, err := os.ReadDir(procRoot)
+	procDir, err := os.Open(procRoot)
 	if err != nil {
-		return nil, fmt.Errorf("read %s failed: %w", procRoot, err)
+		return nil, fmt.Errorf("open %s failed: %w", procRoot, err)
 	}
+	defer procDir.Close()
 
-	pids := make([]int, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid <= 2 {
-			continue
-		}
-		pids = append(pids, pid)
-	}
+	// 每次扫描重建 mount namespace 缓存，避免业务后续挂载 NFS/Ceph 后仍使用旧的 false 结果。
+	deploymentNetworkFSCache.Clear()
+	deploymentNetworkFSCacheCount.Store(0)
 
 	skipContainer := deploymentShouldSkipContainerProcess()
+	linkMode := deploymentProcLinkMode()
 	concurrency := deploymentInventoryConcurrency()
-	jobs := make(chan int)
+	jobs := make(chan int, concurrency*2)
+	var closeOnce sync.Once
+	closeJobs := func() {
+		closeOnce.Do(func() { close(jobs) })
+	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	groups := make(map[string]*deploymentInventoryService)
+
+	// 兜底：无论正常返回、ctx 取消还是 panic，都关闭 jobs 并等待 worker，
+	// 避免 worker 永久阻塞在 jobs 上造成 goroutine 泄漏。
+	defer func() {
+		closeJobs()
+		wg.Wait()
+	}()
 
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[deployment_inventory] process worker panic recovered: %v", r)
+				}
+			}()
 			for pid := range jobs {
 				if ctx.Err() != nil {
 					return
 				}
-				info, ok := deploymentReadProcess(procRoot, pid, skipContainer)
+				info, ok := deploymentReadProcess(procRoot, pid, skipContainer, linkMode)
 				if !ok || info == nil {
 					continue
 				}
@@ -2400,42 +2512,66 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 					continue
 				}
 				key := svc.dedupKey
-				mu.Lock()
-				if existing, ok := groups[key]; ok {
-					existing.instances++
-					// 补全缺失信息
-					if existing.Cwd == "unknown" && svc.Cwd != "unknown" {
-						existing.Cwd = svc.Cwd
+				func() {
+					mu.Lock()
+					defer mu.Unlock()
+					if existing, ok := groups[key]; ok {
+						existing.instances++
+						// 补全缺失信息
+						if existing.Cwd == "unknown" && svc.Cwd != "unknown" {
+							existing.Cwd = svc.Cwd
+						}
+						if existing.Exe == "unknown" && svc.Exe != "unknown" {
+							existing.Exe = svc.Exe
+						}
+						if existing.Middleware == "none" && svc.Middleware != "none" {
+							existing.Middleware = svc.Middleware
+						}
+					} else {
+						copySvc := *svc
+						copySvc.instances = 1
+						groups[key] = &copySvc
 					}
-					if existing.Exe == "unknown" && svc.Exe != "unknown" {
-						existing.Exe = svc.Exe
-					}
-					if existing.Middleware == "none" && svc.Middleware != "none" {
-						existing.Middleware = svc.Middleware
-					}
-				} else {
-					copySvc := *svc
-					copySvc.instances = 1
-					groups[key] = &copySvc
-				}
-				mu.Unlock()
+				}()
 			}
 		}()
 	}
 
-	for _, pid := range pids {
-		select {
-		case jobs <- pid:
-		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
-			return deploymentProcessGroupsToSlice(groups), ctx.Err()
+	// 流式读取 /proc，避免一次性把所有 PID 放入大切片；进程极多时降低峰值内存。
+	var readErr error
+sendLoop:
+	for {
+		entries, err := procDir.ReadDir(512)
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid <= 2 {
+				continue
+			}
+			select {
+			case jobs <- pid:
+			case <-ctx.Done():
+				break sendLoop
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			readErr = err
+			break
 		}
 	}
-	close(jobs)
+	closeJobs()
 	wg.Wait()
-	if err := ctx.Err(); err != nil {
-		return deploymentProcessGroupsToSlice(groups), err
+
+	if ctx.Err() != nil {
+		return deploymentProcessGroupsToSlice(groups), ctx.Err()
+	}
+	if readErr != nil {
+		return deploymentProcessGroupsToSlice(groups), fmt.Errorf("read %s failed: %w", procRoot, readErr)
 	}
 	return deploymentProcessGroupsToSlice(groups), nil
 }
@@ -2545,7 +2681,7 @@ func deploymentBuildProcessService(info *deploymentProcessInfo, skipContainer bo
 
 // deploymentDeriveProcessName 从命令行推导更友好的服务名（如 java -jar app.jar -> app）
 func deploymentDeriveProcessName(comm, cmdline, exe string) string {
-	fields := strings.Fields(cmdline)
+	fields := strings.Fields(deploymentCommandTextForScan(cmdline))
 	for i := 0; i < len(fields)-1; i++ {
 		if fields[i] == "-jar" {
 			base := filepath.Base(strings.Trim(fields[i+1], `"'`))

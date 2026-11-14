@@ -127,7 +127,7 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
   - 默认不采集 Docker / Kubernetes 容器，容器进程默认跳过，避免高基数与卡死
   - 兼容 RHEL/CentOS 6、SUSE 12、Ubuntu 14 等老系统
   - 全异步加载，默认每 24 小时刷新一次，不阻塞 `/metrics`
-  - 数据源并发采集，带超时、卡死跳过、缓存过期与基数保护
+  - 数据源并发采集，带超时、卡死跳过、缓存过期、同名去重与内存控制
   - 详见 [`my_collectors/deployment_inventory_collector.md`](my_collectors/deployment_inventory_collector.md)
 
 ---
