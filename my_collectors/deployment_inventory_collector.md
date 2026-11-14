@@ -137,8 +137,8 @@ export DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true
 - `cwd` 取自 `environ` 中的 `PWD`；
 - 进程条目的 `root` 固定为 `unknown`，systemd 条目取配置中的 `RootDirectory`；
 - 运行状态由进程 cgroup 合并得到，不再调用 systemctl/initctl/supervisorctl；
-- systemd/init.d/upstart/supervisor 配置目录如果位于网络文件系统，通过
-  `/proc/self/mountinfo` 判断后直接跳过，不 open/stat 这些路径；
+- systemd/init.d/upstart/supervisor 配置目录/文件、以及 `DEPLOYMENT_INVENTORY_PROC` 路径，
+  如果位于网络文件系统，通过 `/proc/self/mountinfo` 判断后直接跳过，不 open/stat 这些路径；
 - `/etc/passwd` 仅在本地普通文件时读取，否则用户显示为 UID 数字。
 
 > `/proc` 是内存虚拟文件系统，读取 cmdline/cgroup/status/environ 不涉及业务磁盘路径。

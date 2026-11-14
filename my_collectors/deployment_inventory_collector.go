@@ -1787,18 +1787,21 @@ func deploymentParseUpstartJob(path string) (*deploymentUpstartJob, error) {
 
 	// /etc/init/<job>.override 中的 manual 表示不自动启动
 	overridePath := strings.TrimSuffix(path, ".conf") + ".override"
-	if info, statErr := os.Lstat(overridePath); statErr == nil && info.Mode().IsRegular() {
-		override, err := deploymentReadFileLimited(overridePath, deploymentMaxFileSize)
-		if err != nil {
-			return job, nil
-		}
-		for _, line := range strings.Split(string(override), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
+	if !deploymentIsPathOnNetworkFS(overridePath) {
+		info, statErr := os.Lstat(overridePath)
+		if statErr == nil && info.Mode().IsRegular() {
+			override, err := deploymentReadFileLimited(overridePath, deploymentMaxFileSize)
+			if err != nil {
+				return job, nil
 			}
-			if strings.EqualFold(line, "manual") {
-				job.manual = true
+			for _, line := range strings.Split(string(override), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				if strings.EqualFold(line, "manual") {
+					job.manual = true
+				}
 			}
 		}
 	}
@@ -2418,6 +2421,9 @@ func deploymentShouldSkipContainerProcess() bool {
 // deploymentCollectProcesses 并发扫描 /proc，构建进程级部署清单
 func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryService, error) {
 	procRoot := deploymentProcRoot()
+	if deploymentIsPathOnNetworkFS(procRoot) {
+		return nil, fmt.Errorf("proc root %s is on network filesystem, skip process scan", procRoot)
+	}
 	procDir, err := os.Open(procRoot)
 	if err != nil {
 		return nil, fmt.Errorf("open %s failed: %w", procRoot, err)
