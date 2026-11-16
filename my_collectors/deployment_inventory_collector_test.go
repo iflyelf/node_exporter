@@ -105,6 +105,28 @@ func TestDeploymentPathNetworkFSGuard(t *testing.T) {
 	}
 }
 
+func TestDeploymentApplyActiveSystemdStatus(t *testing.T) {
+	active := map[string]bool{"nginx.service": true}
+	deploymentActiveSystemdUnits.Store(&active)
+	defer deploymentActiveSystemdUnits.Store(nil)
+
+	services := []deploymentInventoryService{
+		{Name: "nginx", StartupType: "systemd", dedupKey: "systemd:nginx.service", Status: "unknown"},
+		{Name: "redis", StartupType: "systemd", dedupKey: "systemd:redis.service", Status: "unknown"},
+		{Name: "myapp", StartupType: "process", Status: "running"},
+	}
+	deploymentApplyActiveSystemdStatus(services)
+	if services[0].Status != "running" {
+		t.Fatalf("nginx should be running, got %q", services[0].Status)
+	}
+	if services[1].Status != "unknown" {
+		t.Fatalf("redis should remain unknown, got %q", services[1].Status)
+	}
+	if services[2].Status != "running" {
+		t.Fatalf("process status changed unexpectedly: %q", services[2].Status)
+	}
+}
+
 func TestDeploymentParseCgroup(t *testing.T) {
 	cases := []struct {
 		cgroup    string

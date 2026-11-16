@@ -91,6 +91,9 @@ var (
 	// deploymentInventorySourceRunning 记录各数据源是否仍有一轮采集未返回
 	deploymentInventorySourceRunning sync.Map
 
+	// deploymentActiveSystemdUnits 进程 cgroup 中出现的 systemd 单元（用于补全运行状态）
+	deploymentActiveSystemdUnits atomic.Pointer[map[string]bool]
+
 	// deploymentInventoryHostUsers 缓存宿主机 /etc/passwd 解析结果
 	deploymentInventoryHostUsersOnce sync.Once
 	deploymentInventoryHostUsersMap  map[int]string
@@ -739,6 +742,8 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 
 	sources := deploymentInventorySources()
 	prev := deploymentInventorySnapshotPtr.Load()
+	// 本轮由进程 cgroup 重新生成；进程源未启用/失败时保持 nil，避免使用过期状态
+	deploymentActiveSystemdUnits.Store(nil)
 
 	results := make(map[string]deploymentInventorySourceResult, len(sources))
 	resultCh := make(chan deploymentInventorySourceResult, len(sources))
@@ -838,6 +843,7 @@ func deploymentInventoryRefreshOnce(parent context.Context) {
 	}
 
 	services = deploymentMergeServices(services)
+	deploymentApplyActiveSystemdStatus(services)
 
 	snapshot := &deploymentInventorySnapshot{
 		services:          services,
@@ -879,6 +885,26 @@ func deploymentIsNumericString(value string) bool {
 		}
 	}
 	return true
+}
+
+func deploymentApplyActiveSystemdStatus(services []deploymentInventoryService) {
+	activePtr := deploymentActiveSystemdUnits.Load()
+	if activePtr == nil {
+		return
+	}
+	active := *activePtr
+	for i := range services {
+		if services[i].StartupType != "systemd" {
+			continue
+		}
+		unit := strings.TrimPrefix(services[i].dedupKey, "systemd:")
+		if unit == services[i].dedupKey {
+			continue
+		}
+		if active[unit] {
+			services[i].Status = "running"
+		}
+	}
 }
 
 // deploymentMergeServices 合并不同数据源的重复服务，并确保服务名唯一
@@ -2314,7 +2340,7 @@ func deploymentReadProcess(procRoot string, pid int, skipContainer bool) (*deplo
 		info.unit, info.container = deploymentParseCgroup(string(data))
 	}
 	if skipContainer && info.container != "" {
-		return nil, false
+		return info, false
 	}
 
 	if data, err := deploymentReadFileLimited(filepath.Join(base, "comm"), 4096); err == nil {
@@ -2348,7 +2374,7 @@ func deploymentReadProcess(procRoot string, pid int, skipContainer bool) (*deplo
 	}
 	info.name = deploymentSanitizeLabel(info.name)
 	if info.name == "" && info.exe == "unknown" && info.cmdline == "" {
-		return nil, false
+		return info, false
 	}
 	info.user = deploymentUserName(info.uid)
 	return info, true
@@ -2440,6 +2466,7 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	groups := make(map[string]*deploymentInventoryService)
+	activeUnits := make(map[string]bool)
 
 	// 兜底：无论正常返回、ctx 取消还是 panic，都关闭 jobs 并等待 worker，
 	// 避免 worker 永久阻塞在 jobs 上造成 goroutine 泄漏。
@@ -2462,6 +2489,13 @@ func deploymentCollectProcesses(ctx context.Context) ([]deploymentInventoryServi
 					return
 				}
 				info, ok := deploymentReadProcess(procRoot, pid, skipContainer)
+				if info != nil && info.unit != "" {
+					func() {
+						mu.Lock()
+						defer mu.Unlock()
+						activeUnits[info.unit] = true
+					}()
+				}
 				if !ok || info == nil {
 					continue
 				}
@@ -2531,6 +2565,7 @@ sendLoop:
 	if readErr != nil {
 		return deploymentProcessGroupsToSlice(groups), fmt.Errorf("read %s failed: %w", procRoot, readErr)
 	}
+	deploymentActiveSystemdUnits.Store(&activeUnits)
 	return deploymentProcessGroupsToSlice(groups), nil
 }
 

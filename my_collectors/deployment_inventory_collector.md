@@ -51,7 +51,7 @@ node_deployment_inventory_info{
 | `cwd` | 进程工作目录，优先取 `environ` 中的 `PWD`；systemd 取 `WorkingDirectory`；否则 `unknown` |
 | `exe` | 可执行文件路径，取自 `cmdline[0]`，不读取 `/proc/<pid>/exe` 链接 |
 | `root` | systemd 取 `RootDirectory`（默认 `/`）；进程条目固定 `unknown`，不读取 `/proc/<pid>/root` |
-| `status` | `running`（进程 cgroup 命中）/ `unknown`（未命中进程） |
+| `status` | `running`（systemd cgroup 命中或进程命中）/ `unknown`（无匹配进程，无法在不执行 systemctl 的情况下确认 inactive/failed） |
 | `enabled` | 是否开机启动：`true` / `false` / `static` / `unknown` |
 | `source` | 数据来源：`systemd` / `initd` / `upstart` / `supervisor` / `process` |
 
@@ -243,6 +243,12 @@ node_deployment_inventory_services_total
     如确需容器内进程，可设置 `DEPLOYMENT_INVENTORY_INCLUDE_CONTAINER_PROCESSES=true`。
 - **node_exporter 运行在容器里，如何采集宿主机？**
   - 需挂载宿主机 `/proc` 并设置 `DEPLOYMENT_INVENTORY_PROC`、`DEPLOYMENT_INVENTORY_HOST_ROOT`。
+- **为什么很多服务 `status="unknown"`？**
+  - 采集器不再执行 `systemctl/initctl/supervisorctl`，systemd 服务状态通过 `/proc/<pid>/cgroup` 补全：
+    只要单元有任意进程，即使该进程被工具/容器过滤，也会被标记为 `running`。
+  - 完全没有进程的单元可能是 stopped/inactive/failed，无法在不执行 systemctl 的情况下区分，
+    因此保持 `unknown`，避免误报为 inactive。
+  - 若 `DEPLOYMENT_INVENTORY_PROCESS=false`，进程 cgroup 状态不可用，配置类服务会保持 unknown。
 - **清单更新不及时？**
   - 默认 24 小时刷新一次，可通过 `DEPLOYMENT_INVENTORY_INTERVAL` 调整；修改后需重启 node_exporter。
 - **指标数量过多/抓取变慢？**
