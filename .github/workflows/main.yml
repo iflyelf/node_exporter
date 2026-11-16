@@ -122,6 +122,13 @@ jobs:
             node_exporter/.build/linux-amd64/node_exporter
             node_exporter/.build/linux-arm64/node_exporter
 
+      - name: 修正多架构基础镜像（使用 TARGETOS/TARGETARCH）
+        run: |
+          # 工作流统一传 ARCH=amd64，导致 arm64 构建仍引用 busybox-linux-amd64。
+          # 改用 buildx 自动注入的 TARGETOS/TARGETARCH，保证多平台镜像可解析。
+          sed -i 's#quay.io/prometheus/busybox-${OS}-${ARCH}:latest#quay.io/prometheus/busybox-${TARGETOS}-${TARGETARCH}:latest#' node_exporter/Dockerfile
+          head -1 node_exporter/Dockerfile
+
       - name: 设置 QEMU（支持多平台 Docker 构建）
         uses: docker/setup-qemu-action@v4
 
